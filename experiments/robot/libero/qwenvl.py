@@ -1,178 +1,390 @@
-# qwenvl.py (修改版 - 使用图像队列和英文 Prompt)
+"""
+qwenvl.py  —  VLM utilities (Qwen2.5-VL)
+
+Functions
+---------
+load_qwen_vl_model          — load model + processor
+check_completion_with_qwen_vl  — judge whether a linear subtask is done
+scan_targets_with_qwen_vl   — (NEW) scan an area and return a list of visible targets
+check_termination_with_qwen_vl — (NEW) judge whether a REPEAT…UNTIL condition is met
+"""
+
+import collections
+import traceback
+from typing import List, Optional, Tuple
 
 import torch
 from PIL import Image
-import numpy as np
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
-import traceback
-import collections 
 
-# 尝试导入 Qwen-VL 官方提供的工具函数 (保持不变)
 from qwen_vl_utils import process_vision_info
-QWEN_UTILS_AVAILABLE = True
+
 print("Successfully imported qwen_vl_utils.process_vision_info.")
 
 
-def load_qwen_vl_model(model_id: str = "Qwen/Qwen2.5-VL-3B-Instruct", device: str = "auto"):
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
 
-    print(f"Attempting to load VLM model: {model_id} to device: {device} (using Flash Attention 2)")
-    model = None
-    processor = None
+def load_qwen_vl_model(
+    model_id: str = "Qwen/Qwen2.5-VL-3B-Instruct",
+    device: str = "auto",
+):
+    """Load Qwen2.5-VL model and processor."""
+    print(f"Loading VLM: {model_id}  device={device}  (flash_attention_2)")
     try:
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_id,
             torch_dtype="auto",
             device_map=device,
             trust_remote_code=True,
-            attn_implementation="flash_attention_2"
+            attn_implementation="flash_attention_2",
         )
         processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-        print("VLM model and processor loaded successfully.")
+        print("VLM loaded successfully.")
         return model, processor
     except Exception as e:
-        print(f"Error: Failed to load VLM model/processor: {e}")
+        print(f"Failed to load VLM: {e}")
         traceback.print_exc()
         return None, None
 
 
+# ---------------------------------------------------------------------------
+# Internal helper: run a single VLM query
+# ---------------------------------------------------------------------------
+
+def _run_vlm_query(
+    vlm_model,
+    vlm_processor,
+    images: List[Image.Image],
+    image_labels: List[str],
+    question: str,
+    max_new_tokens: int = 64,
+) -> str:
+    """
+    Build a multi-image message, run inference, return the decoded response string.
+
+    images       : list of PIL images to include
+    image_labels : one label string per image (shown before each image in the prompt)
+    question     : the question appended after all images
+    """
+    content_list = []
+    for label, img in zip(image_labels, images):
+        content_list.append({"type": "text",  "text": label})
+        content_list.append({"type": "image", "image": img})
+    content_list.append({"type": "text", "text": question})
+
+    messages = [{"role": "user", "content": content_list}]
+
+    text_template = vlm_processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    image_inputs, video_inputs = process_vision_info(messages)
+    if image_inputs is None:
+        return ""
+
+    inputs = vlm_processor(
+        text=[text_template],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    ).to(vlm_model.device)
+
+    with torch.no_grad():
+        generated_ids = vlm_model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=1,
+            do_sample=False,
+            pad_token_id=vlm_processor.tokenizer.eos_token_id,
+        )
+
+    trimmed = [
+        out[len(inp):]
+        for inp, out in zip(inputs.input_ids, generated_ids)
+    ]
+    responses = vlm_processor.batch_decode(
+        trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )
+    return responses[0].strip() if responses else ""
+
+
+def _collect_images_from_queue(
+    image_pair_queue: collections.deque,
+) -> Tuple[List[Image.Image], List[str]]:
+    """Flatten an image-pair queue into (images, labels) lists."""
+    images, labels = [], []
+    for i, pair in enumerate(image_pair_queue):
+        if isinstance(pair, (list, tuple)) and len(pair) == 2:
+            main_img, eih_img = pair
+            images.append(main_img)
+            labels.append(f"Image Pair {i+1} — Main View:")
+            images.append(eih_img)
+            labels.append(f"Image Pair {i+1} — Hand View:")
+        else:
+            # Single image fallback
+            images.append(pair)
+            labels.append(f"Image {i+1}:")
+    return images, labels
+
+
+# ---------------------------------------------------------------------------
+# 1. check_completion_with_qwen_vl  (original, extended)
+# ---------------------------------------------------------------------------
+
 def check_completion_with_qwen_vl(
     vlm_model,
     vlm_processor,
-  
-    image_pair_queue: collections.deque, 
-
-    current_subtask_instruction: str
+    image_pair_queue: collections.deque,
+    current_subtask_instruction: str,
 ) -> bool:
     """
-    Uses the loaded Qwen-VL model to check if the current subtask is complete,
-    based on a sequence of image pairs.
-    Relies on zero-shot prompting and parsing of "Yes"/"No" responses.
-    Uses qwen_vl_utils.process_vision_info for image processing.
-    Prompts and parsing are in English.
-    """
+    Judge whether a linear subtask has been completed.
+    Returns True if the VLM answers "Yes", False otherwise.
 
+    Supports all atomic operations:
+        pick up / place / open / close / turn on / turn off / scan
+    """
     if vlm_model is None or vlm_processor is None:
-        print("[VLM Check] Error: VLM model or processor not loaded.")
+        print("[VLM] Error: model not loaded.")
         return False
-    if not QWEN_UTILS_AVAILABLE:
-        print("[VLM Check] Error: qwen_vl_utils not available.")
-        return False
-    
     if not image_pair_queue:
-        print("[VLM Check] Warning: Image queue is empty. Cannot perform check.")
+        print("[VLM] Warning: image queue empty.")
         return False
-    
 
     try:
-        
+        images, labels = _collect_images_from_queue(image_pair_queue)
+        instr = current_subtask_instruction
+        instr_lower = instr.lower()
 
-        object_name = "the object" # Default English names
-        location_name = "the target location"
-        instruction_lower = current_subtask_instruction.lower()
-        verb = ""
-        object_part_raw = ""
-        if instruction_lower.startswith("pick up"):
-            verb = "pick up"
-            try: object_part_raw = current_subtask_instruction.split(verb, 1)[1].strip().rstrip('.')
-            except: pass
-            object_name = object_part_raw if object_part_raw else object_name
-        elif instruction_lower.startswith("place"):
-            verb = "place"
-            try: object_part_raw = current_subtask_instruction.split(verb, 1)[1].strip().rstrip('.')
-            except: pass
-            split_success = False
-            # Use English prepositions
-            for separator in [" in ", " on ", " into ", " onto "]:
-                if separator in object_part_raw:
-                    obj_temp, loc_temp = object_part_raw.split(separator, 1)
-                    object_name = obj_temp.strip() if obj_temp.strip() else object_name
-                    location_name = loc_temp.strip() if loc_temp.strip() else location_name
-                    split_success = True
-                    break
-            if not split_success: object_name = object_part_raw if object_part_raw else object_name
-        
-        prompt_text = ""
-       
-        prompt_prefix = f"Observe the following sequence of {len(image_pair_queue)} image pairs (main view and hand view over time). The instruction for the robot is: '{current_subtask_instruction}'. "
-
-        if verb == "pick up":
-            
-            prompt_text = f"{prompt_prefix}Based *only* on the image sequence, has '{object_name}' been securely grasped by the gripper and clearly lifted off any surface it was resting on by the end of the sequence? Please answer strictly with 'Yes' or 'No'."
-        elif verb == "place":
-            
-            prompt_text = f"{prompt_prefix}Based *only* on the image sequence, has '{object_name}' been stably placed {location_name} (e.g., 'in the basket', 'on the table'), and does the gripper appear empty or clearly moving away from the object by the end of the sequence? Please answer strictly with 'Yes' or 'No'."
-        else:
-           
-            prompt_text = f"{prompt_prefix}Based *only* on the image sequence and the instruction, has this action been successfully completed by the end of the sequence? Please answer strictly with 'Yes' or 'No'."
-        
-
-        content_list = []
-        
-        for i, (main_img_pil, eih_img_pil) in enumerate(image_pair_queue):
-            content_list.append({"type": "text", "text": f"Image Pair {i+1} (Main View):"})
-            content_list.append({"type": "image", "image": main_img_pil})
-            content_list.append({"type": "text", "text": f"Image Pair {i+1} (Hand View):"})
-            content_list.append({"type": "image", "image": eih_img_pil})
-
-        
-        content_list.append({"type": "text", "text": prompt_text})
-
-        messages = [
-            {
-                "role": "user",
-                "content": content_list,
-            }
-        ]
-        
-        text_template = vlm_processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+        # ── Build a task-specific question ────────────────────────────
+        prefix = (
+            f"Observe the following {len(images)} image(s). "
+            f"The robot instruction is: '{instr}'. "
         )
-        image_inputs, video_inputs = process_vision_info(messages)
-        if image_inputs is None:
-             print("[VLM Check] Error: process_vision_info failed to process image inputs.")
-             return False
 
-        inputs = vlm_processor(
-            text=[text_template],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        ).to(vlm_model.device)
-
-        with torch.no_grad():
-            generated_ids = vlm_model.generate(
-                **inputs,
-                max_new_tokens=10, # Still expect short Yes/No
-                min_new_tokens=1,
-                do_sample=False,
-                pad_token_id=vlm_processor.tokenizer.eos_token_id # Corrected access
+        if instr_lower.startswith("pick up"):
+            obj = instr.split("pick up", 1)[-1].strip().rstrip(".")
+            question = (
+                f"{prefix}Has '{obj}' been securely grasped and clearly lifted "
+                f"off the table surface by the end of the sequence? "
+                f"Answer strictly 'Yes' or 'No'."
+            )
+        elif instr_lower.startswith("place"):
+            # place [object] in/on [location]
+            for sep in [" into ", " in ", " on ", " onto "]:
+                if sep in instr_lower:
+                    obj_part, loc_part = instr.split(sep, 1)
+                    obj = re.sub(r"^place\s+", "", obj_part, flags=re.IGNORECASE).strip()
+                    loc = loc_part.strip().rstrip(".")
+                    question = (
+                        f"{prefix}Has '{obj}' been successfully placed inside/onto "
+                        f"'{loc}', and does the gripper appear open and moving away "
+                        f"from the object? "
+                        f"Answer strictly 'Yes' or 'No'."
+                    )
+                    break
+            else:
+                question = (
+                    f"{prefix}Has the placement action been completed successfully "
+                    f"(object released at the target location)? "
+                    f"Answer strictly 'Yes' or 'No'."
+                )
+        elif instr_lower.startswith("open"):
+            obj = instr.split("open", 1)[-1].strip().rstrip(".")
+            question = (
+                f"{prefix}Is '{obj}' now visibly open (lid/door/drawer moved)? "
+                f"Answer strictly 'Yes' or 'No'."
+            )
+        elif instr_lower.startswith("close"):
+            obj = instr.split("close", 1)[-1].strip().rstrip(".")
+            question = (
+                f"{prefix}Is '{obj}' now visibly closed? "
+                f"Answer strictly 'Yes' or 'No'."
+            )
+        elif instr_lower.startswith("turn on"):
+            dev = instr.split("turn on", 1)[-1].strip().rstrip(".")
+            question = (
+                f"{prefix}Is '{dev}' now turned on (indicator light, visible change)? "
+                f"Answer strictly 'Yes' or 'No'."
+            )
+        elif instr_lower.startswith("turn off"):
+            dev = instr.split("turn off", 1)[-1].strip().rstrip(".")
+            question = (
+                f"{prefix}Is '{dev}' now turned off? "
+                f"Answer strictly 'Yes' or 'No'."
+            )
+        elif instr_lower.startswith("scan"):
+            # scan is a VLM perception step, not a robot action.
+            # Always considered "done" immediately; real output comes from
+            # scan_targets_with_qwen_vl().
+            return True
+        else:
+            question = (
+                f"{prefix}Has this action been successfully completed by the end "
+                f"of the sequence? Answer strictly 'Yes' or 'No'."
             )
 
-        generated_ids_trimmed = [
-            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-        ]
-        response = vlm_processor.batch_decode(
-            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        response = _run_vlm_query(
+            vlm_model, vlm_processor, images, labels, question, max_new_tokens=10
         )
-
-        if response:
-            vlm_response_text = response[0].strip()
-            # print(f"[VLM Check] VLM raw response: '{vlm_response_text}'") # Debug
-
-            # Be a bit lenient: check lower case and potential starting variations
-            if vlm_response_text.lower().startswith("yes"):
-                print(f"[VLM Check] VLM Judgement: COMPLETED (Response: '{vlm_response_text}')")
-                return True
-            else:
-                # print(f"[VLM Check] VLM Judgement: Not Completed (Response: '{vlm_response_text}')") # Debug
-                return False
-
-        else:
-            # print("[VLM Check] VLM Judgement: Not Completed (No valid response)") # Debug
-            return False
+        print(f"[VLM check_completion] '{instr}' → '{response}'")
+        return response.lower().startswith("yes")
 
     except Exception as e:
-        print(f"Error: Exception during VLM check (Instruction: '{current_subtask_instruction}'): {e}")
+        print(f"[VLM] Exception in check_completion: {e}")
         traceback.print_exc()
         return False
+
+
+# ---------------------------------------------------------------------------
+# 2. scan_targets_with_qwen_vl  (NEW)
+# ---------------------------------------------------------------------------
+
+def scan_targets_with_qwen_vl(
+    vlm_model,
+    vlm_processor,
+    image_pair_queue: collections.deque,
+    target_description: str,
+    max_targets: int = 20,
+) -> List[str]:
+    """
+    Scan the current view and return an ordered list of visible target descriptions.
+
+    Called when the executor encounters a `scan [area]` step in a REPEAT block.
+    The returned list is used to populate the subsequent `pick up` instruction
+    with a concrete target (e.g. "the apple on the left side of the table").
+
+    Parameters
+    ----------
+    target_description : str
+        What to look for, e.g. "fruit", "object on the table", "apple".
+        For the table-clearing task, pass "fruit" or "object".
+    max_targets : int
+        Upper bound on how many targets to report.
+
+    Returns
+    -------
+    List[str]
+        Ordered list of target descriptions, nearest/easiest first, e.g.:
+        ["the apple on the left side of the table",
+         "the orange near the center of the table",
+         "the banana on the right side of the table"]
+        Returns an empty list if none are found or on error.
+    """
+    if vlm_model is None or vlm_processor is None:
+        print("[VLM scan] Error: model not loaded.")
+        return []
+    if not image_pair_queue:
+        print("[VLM scan] Warning: image queue empty.")
+        return []
+
+    try:
+        images, labels = _collect_images_from_queue(image_pair_queue)
+
+        question = (
+            f"Look at the table in the image(s) carefully. "
+            f"List ALL visible '{target_description}' objects currently on the table "
+            f"that the robot arm can reach, ordered from nearest/easiest to grasp first. "
+            f"For each object, include its type and position "
+            f"(e.g. 'the apple on the left side of the table', "
+            f"'the orange near the center', 'the banana on the right'). "
+            f"Output ONLY a numbered list, one item per line. "
+            f"If the table is clear (no {target_description} remaining), "
+            f"output exactly: NONE"
+        )
+
+        response = _run_vlm_query(
+            vlm_model, vlm_processor, images, labels, question, max_new_tokens=256
+        )
+        print(f"[VLM scan] raw response:\n{response}")
+
+        if not response or response.strip().upper() == "NONE":
+            return []
+
+        # Parse numbered list
+        targets = []
+        for line in response.splitlines():
+            line = line.strip()
+            m = re.match(r"^\d+[\.\)]\s*(.*)", line)
+            if m:
+                item = m.group(1).strip()
+                if item:
+                    targets.append(item)
+            elif line and not line.upper().startswith("NONE"):
+                targets.append(line)
+            if len(targets) >= max_targets:
+                break
+
+        print(f"[VLM scan] found {len(targets)} target(s): {targets}")
+        return targets
+
+    except Exception as e:
+        print(f"[VLM] Exception in scan_targets: {e}")
+        traceback.print_exc()
+        return []
+
+
+# ---------------------------------------------------------------------------
+# 3. check_termination_with_qwen_vl  (NEW)
+# ---------------------------------------------------------------------------
+
+def check_termination_with_qwen_vl(
+    vlm_model,
+    vlm_processor,
+    image_pair_queue: collections.deque,
+    until_condition: str,
+) -> bool:
+    """
+    Judge whether the UNTIL termination condition of a REPEAT…UNTIL loop is met.
+
+    For the table-clearing task the typical condition is:
+        "no fruits remain on the table"
+
+    Parameters
+    ----------
+    until_condition : str
+        Natural-language condition from the plan, e.g.
+        "no fruits remain on the table".
+
+    Returns
+    -------
+    bool
+        True  → condition is met, exit the loop (table is clear).
+        False → condition not yet met, continue looping.
+    """
+    if vlm_model is None or vlm_processor is None:
+        print("[VLM termination] Error: model not loaded.")
+        return False
+    if not image_pair_queue:
+        print("[VLM termination] Warning: image queue empty.")
+        return False
+
+    try:
+        images, labels = _collect_images_from_queue(image_pair_queue)
+
+        question = (
+            f"Observe the image(s) carefully. "
+            f"Termination condition: '{until_condition}'. "
+            f"Based ONLY on what is visible in the image(s), "
+            f"is this termination condition currently TRUE? "
+            f"Answer strictly 'Yes' or 'No'."
+        )
+
+        response = _run_vlm_query(
+            vlm_model, vlm_processor, images, labels, question, max_new_tokens=10
+        )
+        print(f"[VLM termination] '{until_condition}' → '{response}'")
+        return response.lower().startswith("yes")
+
+    except Exception as e:
+        print(f"[VLM] Exception in check_termination: {e}")
+        traceback.print_exc()
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Keep re import at module level (used in check_completion)
+# ---------------------------------------------------------------------------
+import re

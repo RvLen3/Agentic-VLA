@@ -40,7 +40,8 @@ from experiments.robot.libero.libero_utils import (
     quat2axisangle,
     save_rollout_video,
 )
-from experiments.robot.openvla_utils import get_processor
+from experiments.robot.openvla_utils import get_processor as get_openvla_processor
+from experiments.robot.xvla_utils import get_processor as get_xvla_processor
 from experiments.robot.robot_utils import (
     DATE_TIME,
     get_action,
@@ -59,7 +60,7 @@ class GenerateConfig:
     #################################################################################################################
     # Model-specific parameters
     #################################################################################################################
-    model_family: str = "openvla"                    # Model family
+    model_family: str = "xvla"                      # Model family
     pretrained_checkpoint: Union[str, Path] = ""     # Pretrained checkpoint path
     load_in_8bit: bool = False                       # (For OpenVLA only) Load with 8-bit quantization
     load_in_4bit: bool = False                       # (For OpenVLA only) Load with 4-bit quantization
@@ -112,10 +113,12 @@ def eval_libero(cfg: GenerateConfig) -> None:
             cfg.unnorm_key = f"{cfg.unnorm_key}_no_noops"
         assert cfg.unnorm_key in model.norm_stats, f"Action un-norm key {cfg.unnorm_key} not found in VLA `norm_stats`!"
 
-    # [OpenVLA] Get Hugging Face processor
+    # Get Hugging Face processor
     processor = None
     if cfg.model_family == "openvla":
-        processor = get_processor(cfg)
+        processor = get_openvla_processor(cfg)
+    elif cfg.model_family == "xvla":
+        processor = get_xvla_processor(cfg)
 
     # Initialize local logging
     run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-{DATE_TIME}"

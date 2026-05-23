@@ -8,8 +8,12 @@ import numpy as np
 import torch
 
 from experiments.robot.openvla_utils import (
-    get_vla,
-    get_vla_action,
+    get_vla as get_openvla,
+    get_vla_action as get_openvla_action,
+)
+from experiments.robot.xvla_utils import (
+    get_vla as get_xvla,
+    get_vla_action as get_xvla_action,
 )
 
 # Initialize important constants and pretty-printing mode in NumPy.
@@ -40,7 +44,9 @@ def set_seed_everywhere(seed: int):
 def get_model(cfg, wrap_diffusion_policy_for_droid=False):
     """Load model for evaluation."""
     if cfg.model_family == "openvla":
-        model = get_vla(cfg)
+        model = get_openvla(cfg)
+    elif cfg.model_family == "xvla":
+        model = get_xvla(cfg)
     else:
         raise ValueError("Unexpected `model_family` found in config.")
     print(f"Loaded model: {type(model)}")
@@ -55,6 +61,9 @@ def get_image_resize_size(cfg):
     """
     if cfg.model_family == "openvla":
         resize_size = 224
+    elif cfg.model_family == "xvla":
+        # X-VLA uses 224x224 images (Florence-2 backbone)
+        resize_size = 224
     else:
         raise ValueError("Unexpected `model_family` found in config.")
     return resize_size
@@ -63,8 +72,13 @@ def get_image_resize_size(cfg):
 def get_action(cfg, model, obs, task_label, processor=None):
     """Queries the model to get an action."""
     if cfg.model_family == "openvla":
-        action = get_vla_action(
+        action = get_openvla_action(
             model, processor, cfg.pretrained_checkpoint, obs, task_label, cfg.unnorm_key, center_crop=cfg.center_crop
+        )
+        assert action.shape == (ACTION_DIM,)
+    elif cfg.model_family == "xvla":
+        action = get_xvla_action(
+            model, processor, cfg.pretrained_checkpoint, obs, task_label
         )
         assert action.shape == (ACTION_DIM,)
     else:
