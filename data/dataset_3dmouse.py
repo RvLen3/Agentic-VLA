@@ -102,6 +102,30 @@ GRIPPER_REG_SPEED     = 0x0101  # 速度寄存器（可选，部分型号支持�
 GRIPPER_SPEED_DEFAULT = 500     # 速度（0-1000）
 # ===============================================
 
+# 3D Mouse -> robot coordinate mapping (same math as demo_real_robot.py)
+MAP_ROTATION_DEG = 100.0
+MAP_TILT_DEG     = -36.0
+MAP_XY_ROT_DEG   = 36.0
+
+def get_teleop_rotation(theta_deg, tilt_deg, xy_rot_deg):
+    """Compute 3x3 rotation matrix from 3D Mouse frame to robot frame."""
+    theta, tilt, phi = np.radians([theta_deg, tilt_deg, xy_rot_deg])
+    u_base = np.array([0, -np.sin(theta), np.cos(theta)])
+    zenith = np.array([1, 0, 0])
+    v_base_h = np.cross(zenith, u_base)
+    u_orig = u_base
+    v_orig = v_base_h * np.cos(tilt) + zenith * np.sin(tilt)
+    u_orig /= np.linalg.norm(u_orig)
+    v_orig /= np.linalg.norm(v_orig)
+    u_final = u_orig * np.cos(phi) - v_orig * np.sin(phi)
+    v_final = u_orig * np.sin(phi) + v_orig * np.cos(phi)
+    w_final = np.cross(v_final, u_final)
+    # R @ [mouse_x, mouse_y, mouse_z] -> robot frame
+    # mouse x -> v_final, mouse y -> u_final, mouse z -> w_final
+    return np.column_stack([v_final, u_final, w_final])
+
+_MOUSE2ROBOT = get_teleop_rotation(MAP_ROTATION_DEG, MAP_TILT_DEG, MAP_XY_ROT_DEG)
+
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 # 蔬菜种类（与 dataset.py 保持一致）
@@ -246,14 +270,13 @@ class SpaceMouseReader:
         s = self.state
         if s is None:
             return [0.0] * 6
-        # 字段名：x/y/z（平移）, roll/pitch/yaw（旋转）
+        mouse_trans = np.array([float(s.x), float(s.y), float(s.z)])
+        mouse_rot   = np.array([float(s.roll), float(s.pitch), float(s.yaw)])
+        robot_trans = _MOUSE2ROBOT @ mouse_trans * TRANS_SCALE
+        robot_rot   = _MOUSE2ROBOT @ mouse_rot * ROT_SCALE
         return [
-            float(s.x)     * TRANS_SCALE,
-            float(s.y)     * TRANS_SCALE,
-            float(s.z)     * TRANS_SCALE,
-            float(s.roll)  * ROT_SCALE,
-            float(s.pitch) * ROT_SCALE,
-            float(s.yaw)   * ROT_SCALE,
+            robot_trans[0], robot_trans[1], robot_trans[2],
+            robot_rot[0],   robot_rot[1],   robot_rot[2],
         ]
 
     def get_buttons(self):
