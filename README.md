@@ -21,14 +21,14 @@ Long-horizon robotic manipulation poses significant challenges for autonomous sy
 ---
 ## Daily Update
 
-- **[2026/05/26]** 
-    精简了原子操作的内容，从 Place X into the right/left basket 修改为 **Place it into the basket** .
-    优化了任务设计，不再是单次将全部水果放到篮子里，修改后挑选指定水果放到篮子里，即 **Put both A and B into the basket** .
-    新增部分代码:
-    **demo_real_robot.py**:
-    **tune_mapping.py**:
-    **mapping.py**:
-    **calibrate_mapping.py**:
+- **[2026/05/26]**
+  - 精简了原子操作的内容，从 `Place X into the right/left basket` 修改为 **`Place it into the basket`**，去掉了具体蔬菜类型和篮子方向。
+  - 优化了任务设计，不再是单次将全部水果放到篮子里，修改后挑选指定水果放到篮子里，即 **`Put both A and B into the basket`**。
+  - 新增部分代码：
+    - **`demo_real_robot.py`**：真实机器人推理演示脚本，集成 LRM 任务分解 + VLA 执行 + VLM 验证的完整闭环流程。
+    - **`tune_mapping.py`**：动作空间映射参数调优脚本，用于校准 VLA 输出到真实机械臂关节/末端指令的缩放系数。
+    - **`mapping.py`**：动作空间映射模块，定义 VLA 模型输出与 UR 机械臂控制指令之间的转换逻辑。
+    - **`calibrate_mapping.py`**：映射标定工具，通过采集标定数据自动计算最优映射参数。
 
 
 
