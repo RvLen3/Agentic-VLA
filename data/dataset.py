@@ -1,33 +1,37 @@
 """
-UR7e 左臂自由拖动示教数据采集
+UR7e 左臂 键盘控制示教数据采集
 双 RealSense RGB + D405 Depth
-仅需 RTDEReceiveInterface（只读），不需要远程控制权限
+使用 RTDEControlInterface 发送 speedL 主动控制机械臂
 
 使用前：
-1. 示教器上切换到本地手动模式
-2. 开启自由驱动 Freedrive
-3. 确认左臂两台 RealSense 摄像头已连接
-4. 根据你的实际环境修改 ROBOT_IP
+1. 示教器上切换到远程控制模式（Remote Control）
+2. 确认左臂两台 RealSense 摄像头已连接
+3. 根据你的实际环境修改 ROBOT_IP
 
 摄像头:
 - Intel RealSense D435i: 主视角 RGB
 - Intel RealSense D405: 腕部视角 RGB + Depth
 
+键盘映射：
+  W/S      → 前进/后退       R/F      → 上升/下降
+  A/D      → 左移/右移
+  O/K      → 左旋/右旋 (yaw)
+  P/L      → 前倾/后仰 (pitch)
+  M/N      → 手爪正旋/反旋 (roll)
+  G        → 夹爪开/闭（按一次切换）
+  Q        → 结束当前轨迹并保存
+  松手即停（无按键时速度归零）
+
 保存内容:
 - images: 主视角 RGB, uint8, 256x256x3
 - images_wrist: 腕部 RGB, uint8, 256x256x3
 - depths_d405: D405 深度, uint16, 256x256
-- d405_depth_scale: D405 深度尺度，米 = depth_raw * d405_depth_scale
+- d405_depth_scale: D405 深度尺度
 - tcp_poses: TCP 位姿
 - joint_positions: 关节角
-- gripper: 手动标记夹爪状态，0.0=闭合，1.0=打开
+- gripper: 夹爪状态，0.0=闭合，1.0=打开
 - instruction: 语言指令
 - fps: 采集帧率
-
-按键交互：
-- 所有确认/选择操作在终端中完成（input）
-- 录制中的 g/c/q 按键也在终端中输入
-- 视频窗口仅负责展示画面和当前子任务信息
 """
 
 import cv2
@@ -37,9 +41,20 @@ import numpy as np
 import pyrealsense2 as rs
 from pathlib import Path
 from rtde_receive import RTDEReceiveInterface
+from rtde_control import RTDEControlInterface
+import threading
 
-# ── 终端非阻塞按键检测（Windows）──────────────────────────────────────
-import msvcrt
+# ── 终端非阻塞按键检测（跨平台）─────────────────────────────────────
+try:
+    import msvcrt
+    _USE_MSVCRT = True
+except ImportError:
+    _USE_MSVCRT = False
+    # Linux / WSL: 使用 select + termios
+    import sys
+    import select
+    import tty
+    import termios
 
 
 SCRIPT_VERSION = "LEFT_RGB_PLUS_D405_DEPTH_TERMINAL_KEYS_V4"
@@ -77,6 +92,111 @@ SAVE_WIDTH = 256
 SAVE_HEIGHT = 256
 # ===============================================
 
+# Speed control config (keyboard -> speedl)
+TRANS_SPEED   = 0.03   # m/s per key press (WASD)
+ROT_SPEED     = 0.15   # rad/s per key press (OK/PL/MN)
+SPEEDL_ACC    = 0.5    # speedl acceleration
+SPEEDL_TIME   = 0.05   # speedl lookahead time
+
+# Coordinate mapping: 3D Mouse / keyboard -> robot frame (from demo_real_robot.py)
+MAP_ROTATION_DEG = 100.0
+MAP_TILT_DEG     = -36.0
+MAP_XY_ROT_DEG   = 36.0
+
+def get_teleop_rotation(theta_deg, tilt_deg, xy_rot_deg):
+    """Compute 3x3 rotation matrix from keyboard intuition to robot frame."""
+    theta, tilt, phi = np.radians([theta_deg, tilt_deg, xy_rot_deg])
+    u_base = np.array([0, -np.sin(theta), np.cos(theta)])
+    zenith = np.array([1, 0, 0])
+    v_base_h = np.cross(zenith, u_base)
+    u_orig = u_base
+    v_orig = v_base_h * np.cos(tilt) + zenith * np.sin(tilt)
+    u_orig /= np.linalg.norm(u_orig)
+    v_orig /= np.linalg.norm(v_orig)
+    u_final = u_orig * np.cos(phi) - v_orig * np.sin(phi)
+    v_final = u_orig * np.sin(phi) + v_orig * np.cos(phi)
+    w_final = np.cross(v_final, u_final)
+    # R @ [lateral, forward, up] -> robot frame
+    return np.column_stack([v_final, u_final, w_final])
+
+_MOUSE2ROBOT = get_teleop_rotation(MAP_ROTATION_DEG, MAP_TILT_DEG, MAP_XY_ROT_DEG)
+
+# ----- Arm control thread (sends speedl at 50 Hz) --------------------
+class ArmControlThread:
+    """Background thread that continuously sends speedl so the robot
+    doesn't timeout between main-loop iterations."""
+
+    CONTROL_HZ = 50
+    CONTROL_DT = 1.0 / 50
+
+    def __init__(self, robot_ip):
+        self._ip = robot_ip
+        self.velocity = [0.0] * 6      # [vx,vy,vz, rx,ry,rz]  in robot frame
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread = None
+        self._rtde_c = None
+
+    def start(self):
+        try:
+            self._rtde_c = RTDEControlInterface(self._ip)
+        except Exception as e:
+            print(f"  [ArmCtrl] RTDEControlInterface failed: {e}")
+            return False
+        # try sending a zero-velocity command to verify readiness
+        try:
+            self._rtde_c.speedL([0.0] * 6, SPEEDL_ACC, 0.0)
+        except Exception:
+            print("  [ArmCtrl] speedL test failed, trying unlockProtectiveStop ...")
+            try:
+                self._rtde_c.unlockProtectiveStop()
+                time.sleep(1.5)
+            except Exception:
+                pass
+            try:
+                self._rtde_c.speedL([0.0] * 6, SPEEDL_ACC, 0.0)
+            except Exception as e:
+                print(f"  [ArmCtrl] still cannot send speedL: {e}")
+                self._rtde_c.disconnect()
+                return False
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="ArmCtrl")
+        self._thread.start()
+        print("  [ArmCtrl] control thread started (50 Hz)")
+        return True
+
+    def _loop(self):
+        while self._running:
+            t0 = time.perf_counter()
+            with self._lock:
+                vel = list(self.velocity)
+            try:
+                self._rtde_c.speedL(vel, SPEEDL_ACC, SPEEDL_TIME)
+            except Exception:
+                pass  # transient errors are tolerated by the next iteration
+            elapsed = time.perf_counter() - t0
+            sleep_t = self.CONTROL_DT - elapsed
+            if sleep_t > 0:
+                time.sleep(sleep_t)
+
+    def set_velocity(self, vel):
+        with self._lock:
+            self.velocity = list(vel)
+
+    def stop(self):
+        self._running = False
+        if self._rtde_c is not None:
+            try:
+                self._rtde_c.speedL([0.0]*6, SPEEDL_ACC, 0.0)
+                self._rtde_c.speedStop()
+                self._rtde_c.disconnect()
+            except Exception:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        print("  [ArmCtrl] control thread stopped")
+
+# -------------------------------------------------------------------
 
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -235,20 +355,46 @@ def capture_rgb_frames(pipelines):
 
 def check_terminal_key():
     """
-    非阻塞检测终端按键（Windows msvcrt）。
+    非阻塞检测终端按键。
+    Windows 使用 msvcrt，Linux/WSL 使用 select + termios。
     返回按下的字符（小写），无按键返回 None。
     """
-    if msvcrt.kbhit():
-        ch = msvcrt.getch()
-        # 处理特殊键（如方向键会先返回 b'\xe0' 或 b'\x00'）
-        if ch in (b'\xe0', b'\x00'):
-            msvcrt.getch()  # 丢弃第二个字节
-            return None
-        try:
-            return ch.decode('utf-8').lower()
-        except Exception:
-            return None
-    return None
+    if _USE_MSVCRT:
+        if msvcrt.kbhit():
+            ch = msvcrt.getch()
+            if ch in (b'\xe0', b'\x00'):
+                msvcrt.getch()  # 丢弃特殊键第二字节
+                return None
+            try:
+                return ch.decode('utf-8').lower()
+            except Exception:
+                return None
+        return None
+    else:
+        # Linux / WSL
+        dr, _, _ = select.select([sys.stdin], [], [], 0)
+        if dr:
+            ch = sys.stdin.read(1)
+            return ch.lower() if ch else None
+        return None
+
+
+# Linux/WSL 下需要将终端设为 raw 模式才能逐字符读取
+_original_termios = None
+
+def _setup_terminal():
+    """进入 raw 模式（仅 Linux/WSL）。"""
+    global _original_termios
+    if not _USE_MSVCRT:
+        _original_termios = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+
+def _restore_terminal():
+    """恢复终端设置（仅 Linux/WSL）。"""
+    global _original_termios
+    if not _USE_MSVCRT and _original_termios is not None:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, _original_termios)
+        _original_termios = None
 
 
 def generate_episode_sequence():
@@ -270,6 +416,7 @@ def generate_episode_sequence():
 def main():
     pipelines = []
     rtde_r = None
+    arm_ctrl = None
     saved_count = 0
 
     try:
@@ -286,6 +433,7 @@ def main():
         print("正在预览摄像头画面...")
         print("终端按 's' 交换视角，按 Enter 确认")
 
+        _setup_terminal()  # 预览阶段也需要逐字符读取
         while True:
             try:
                 img1 = get_rgb_frame(pipe_main)
@@ -311,6 +459,7 @@ def main():
                 print(f"已交换 -> 主视角: {pipe_main['name']}，腕部: {pipe_wrist['name']}")
 
         cv2.destroyAllWindows()
+        _restore_terminal()  # 恢复终端以便后续 input() 正常
 
         active_pipelines = [pipe_main, pipe_wrist]
 
@@ -320,24 +469,26 @@ def main():
             raise RuntimeError("未找到 D405 或 D405 未启用 depth")
         print(f"\nD405: {pipe_d405['name']}, depth_scale={pipe_d405['depth_scale']}")
 
-        # ── 初始连接 RTDE ─────────────────────────────────────────────
-        print("\n正在连接机器人（只读模式）...")
+        # ── 初始连接 RTDE Receive ────────────────────────────────────
+        print("\n正在连接机器人（读取状态）...")
         rtde_r = reconnect_rtde(rtde_r)
 
         # ── 夹爪状态 ─────────────────────────────────────────────────
         gripper_state = 0.0  # 0.0=闭合, 1.0=打开
 
+        # ── 操作说明 ─────────────────────────────────────────────────
         print("\n" + "=" * 60)
-        print("UR7e 左臂自由拖动采集（双 RealSense RGB + D405 Depth）")
+        print("UR7e 左臂 键盘控制采集（双 RealSense RGB + D405 Depth）")
         print("=" * 60)
-        print("操作步骤：")
-        print("  0. 示教器上进入 本地手动模式 → 开启自由驱动 Freedrive")
-        print("  1. 按住示教器背面按钮，手拖机器人")
-        print("  2. 终端按 'g' 标记夹爪打开，按 'c' 标记夹爪闭合")
-        print("  3. 终端按 'q' 结束当前轨迹并保存")
-        print("  4. 终端按 Enter 开始下一条")
+        print("键盘映射：")
+        print("  W/S      → 前进/后退       A/D      → 左移/右移")
+        print("  O/K      → 左旋/右旋(yaw)  P/L      → 前倾/后仰(pitch)")
+        print("  M/N      → 手爪正旋/反旋(roll)")
+        print("  G        → 夹爪开/闭（按一次切换）")
+        print("  Q        → 结束当前轨迹并保存")
+        print("  松手即停（所有轴自动归零）")
         print("=" * 60)
-        print("注意：所有按键在终端窗口中操作，视频窗口仅显示画面。")
+        print("注意：终端窗口获得焦点时按键生效，视频窗口仅显示画面。")
 
         episode = get_next_episode_id(SAVE_DIR)
         interval = 1.0 / FPS
@@ -365,14 +516,23 @@ def main():
                 print(f"  指令: {task_instruction}")
                 print(f"  操作: {'拾取' if op_type == 'pick_up' else '放置'}")
                 print(f"{'─' * 60}")
-                print("按住示教器自由驱动按钮，将机器人移到起始位置")
-                input("准备好后按 Enter 开始录制...")
+                print("将机器人移到起始位置（WASD移动）")
+                input("准备好后按 Enter 开始录制（将启动控制线程）...")
 
-                # 每条轨迹开始前重新连接 RTDE
-                print("重新连接 RTDE...")
+                # 重新连接 RTDE Receive
+                print("重新连接 RTDE Receive...")
                 rtde_r = reconnect_rtde(rtde_r)
 
-                print(">>> 录制已开始！终端按 g=打开夹爪, c=闭合夹爪, q=结束 <<<")
+                # 启动控制线程
+                print("启动机械臂控制线程...")
+                arm_ctrl = ArmControlThread(ROBOT_IP)
+                if not arm_ctrl.start():
+                    print("  控制线程启动失败！请确认示教器处于远程控制模式。")
+                    _restore_terminal()
+                    continue
+
+                print(">>> 录制已开始！WASD/RF=移动  OK/PL/MN=旋转  G=夹爪切换  Q=结束 <<<")
+                _setup_terminal()  # 进入 raw 模式以支持逐字符读取
 
                 images_main = []
                 images_wrist = []
@@ -462,7 +622,7 @@ def main():
 
                     # 底部操作提示
                     cv2.putText(display_m,
-                                "Terminal: g=open, c=close, q=stop",
+                                "WASD/RF=move OKPLMN=rot G=grip Q=stop",
                                 (10, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
 
                     cv2.putText(display_w, "Wrist", (10, 30),
@@ -480,24 +640,59 @@ def main():
                     # waitKey 仅用于刷新 OpenCV 窗口（不用于按键检测）
                     cv2.waitKey(1)
 
-                    # ── 终端按键检测（非阻塞）────────────────────────
-                    key = check_terminal_key()
-                    if key == 'c':
-                        gripper_state = 0.0
-                        gripper_states[-1] = 0.0
-                        print("  标记: 夹爪 → 闭合")
-                    elif key == 'g':
-                        gripper_state = 1.0
-                        gripper_states[-1] = 1.0
-                        print("  标记: 夹爪 → 打开")
-                    elif key == 'q':
+                    # Drain keyboard buffer (10ms window) and build velocity
+                    t_deadline = time.perf_counter() + 0.01
+                    keys = set()
+                    stop_requested = False
+                    while time.perf_counter() < t_deadline:
+                        k = check_terminal_key()
+                        if k is None:
+                            break
+                        if k == 'q':
+                            stop_requested = True
+                            break
+                        keys.add(k)
+
+                    if stop_requested:
                         break
+
+                    # G toggle gripper (one-shot toggle, not velocity)
+                    if 'g' in keys:
+                        gripper_state = 1.0 - gripper_state
+                        gripper_states[-1] = gripper_state
+                        print(f"  夹爪 → {'打开' if gripper_state > 0.5 else '闭合'}")
+
+                    # Build velocity from held keys (opposing keys cancel)
+                    vx = vy = vz = rx = ry = rz = 0.0
+                    if 'd' in keys: vx += TRANS_SPEED
+                    if 'a' in keys: vx -= TRANS_SPEED
+                    if 'w' in keys: vy += TRANS_SPEED
+                    if 's' in keys: vy -= TRANS_SPEED
+                    if 'r' in keys: vz += TRANS_SPEED
+                    if 'f' in keys: vz -= TRANS_SPEED
+                    if 'o' in keys: rz += ROT_SPEED
+                    if 'k' in keys: rz -= ROT_SPEED
+                    if 'p' in keys: ry += ROT_SPEED
+                    if 'l' in keys: ry -= ROT_SPEED
+                    if 'm' in keys: rx += ROT_SPEED
+                    if 'n' in keys: rx -= ROT_SPEED
+
+                    # Apply coordinate mapping (same as demo_real_robot.py)
+                    mouse_trans = np.array([vx, vy, vz])
+                    mouse_rot   = np.array([rx, ry, rz])
+                    robot_trans = _MOUSE2ROBOT @ mouse_trans
+                    robot_rot   = _MOUSE2ROBOT @ mouse_rot
+                    arm_ctrl.set_velocity([*robot_trans, *robot_rot])
 
                     elapsed = time.time() - loop_start
                     if elapsed < interval:
                         time.sleep(interval - elapsed)
 
+                # Stop control thread before saving
+                arm_ctrl.stop()
+
                 # ── 保存本条轨迹 ──────────────────────────────────────
+                _restore_terminal()  # 恢复终端，以便 input() 正常工作
                 if len(images_main) < 30:
                     print(f"  轨迹太短（{len(images_main)} 帧），丢弃")
                     print("  注意：跳过此条，继续下一条。如需重录请在本轮结束后重新开始。")
@@ -542,6 +737,12 @@ def main():
         print("\n用户中断")
 
     finally:
+        _restore_terminal()
+        if arm_ctrl is not None:
+            try:
+                arm_ctrl.stop()
+            except Exception:
+                pass
         if rtde_r is not None:
             try:
                 if hasattr(rtde_r, "disconnect"):
