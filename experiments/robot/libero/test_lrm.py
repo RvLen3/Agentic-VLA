@@ -26,13 +26,13 @@ SAMPLE_HARVEST_PLAN = """\
 REPEAT:
   1. scan the table
   2. pick up the nearest visible fruit on the table
-  3. place the fruit in the basket
+  3. place it in the basket
 UNTIL: no fruits remain on the table
 """
 
 SAMPLE_LINEAR_PLAN = """\
 1. pick up the apple
-2. place the apple in the basket
+2. place it in the basket
 """
 
 

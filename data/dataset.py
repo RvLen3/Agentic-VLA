@@ -400,16 +400,15 @@ def _restore_terminal():
 def generate_episode_sequence():
     """
     生成一轮完整的采集序列：
-    随机打乱蔬菜顺序，每种随机分配左/右篮子，
-    展开为 pick up → place 的原子指令对（共 12 条）。
+    随机打乱蔬菜顺序，展开为 pick up → place 的原子指令对（共 12 条）。
+    place 操作统一为 "place it in the basket"，不区分方向和蔬菜类型。
     """
     shuffled = VEGETABLES[:]
     random.shuffle(shuffled)
     sequence = []
     for veg in shuffled:
-        side = random.choice(["left", "right"])
         sequence.append((f"pick up the {veg}", "pick_up"))
-        sequence.append((f"place the {veg} in the {side} basket", "place"))
+        sequence.append(("place it in the basket", "place"))
     return sequence
 
 

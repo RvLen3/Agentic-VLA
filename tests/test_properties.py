@@ -235,14 +235,14 @@ def test_property3_normalized_action_value_range(q01_list, q99_list):
 # 预定义的合法计划字符串列表
 _VALID_PLAN_STRINGS = [
     # 线性计划
-    "1. pick up the apple\n2. place the apple in the basket",
+    "1. pick up the apple\n2. place it in the basket",
     "1. pick up the orange",
     "1. open the drawer\n2. pick up the cup\n3. close the drawer",
     # REPEAT 块计划
-    "REPEAT:\n  1. scan the table\n  2. pick up the nearest visible fruit\n  3. place the fruit in the basket\nUNTIL: no fruits remain on the table",
+    "REPEAT:\n  1. scan the table\n  2. pick up the nearest visible fruit\n  3. place it in the basket\nUNTIL: no fruits remain on the table",
     "REPEAT:\n  1. scan the table\n  2. pick up the nearest visible object\nUNTIL: the table is clear",
     # 混合计划（线性 + REPEAT）
-    "1. open the basket\nREPEAT:\n  1. scan the table\n  2. pick up the nearest visible fruit\n  3. place the fruit in the basket\nUNTIL: no fruits remain on the table\n2. close the basket",
+    "1. open the basket\nREPEAT:\n  1. scan the table\n  2. pick up the nearest visible fruit\n  3. place it in the basket\nUNTIL: no fruits remain on the table\n2. close the basket",
 ]
 
 
@@ -306,9 +306,8 @@ def test_property8_is_harvest_task_keyword_routing(keyword):
 _BODY_STEPS = [
     "scan the table",
     "pick up the nearest visible fruit",
-    "place the fruit in the basket",
+    "place it in the basket",
     "pick up the nearest visible object on the table",
-    "place the object in the box",
     "scan the surface",
 ]
 

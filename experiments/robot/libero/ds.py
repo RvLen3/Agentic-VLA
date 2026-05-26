@@ -8,21 +8,20 @@ Supported plan structures
 --------------------------
 Linear plan  (original):
     1. pick up the red pepper
-    2. place the red pepper in the left basket
+    2. place it in the basket
 
 REPEAT…UNTIL plan  (for tasks with unknown/variable target count):
     REPEAT:
       1. scan the table
       2. pick up the nearest visible vegetable
-      3. place the vegetable in the left basket
+      3. place it in the basket
     UNTIL: no vegetables remain on the table
 
 Atomic operations
 -----------------
 Linear:
     pick up [object]
-    place [object] in the left basket
-    place [object] in the right basket
+    place it in the basket
     open [object]
     close [object]
     turn on [device]
@@ -35,7 +34,7 @@ Collection / long-horizon additions:
 Target objects for this task
 -----------------------------
 Vegetables: red pepper, green pepper, yellow pepper, corn, purple sweet potato, pumpkin
-Baskets: left basket, right basket (two baskets on the table, one on each side)
+Basket: one basket on the table
 """
 
 import os
@@ -168,9 +167,7 @@ You are a planning assistant for a robotic arm performing a **table-clearing or 
 collection task** where the number of target objects is unknown and must be \
 discovered visually at runtime.
 
-The current task involves clearing vegetables from a table into two baskets:
-  - Left basket  (on the left side of the table)
-  - Right basket (on the right side of the table)
+The current task involves clearing vegetables from a table into a basket.
 Target vegetables: red pepper, green pepper, yellow pepper, corn, purple sweet potato, pumpkin.
 
 Output Format:
@@ -180,8 +177,7 @@ linear steps before/after it.
 Allowed atomic commands:
   Linear steps (before/after the loop):
     pick up [object]
-    place [object] in the left basket
-    place [object] in the right basket
+    place it in the basket
     open [object/container/drawer]
     close [object/container/drawer]
     turn on [device]
@@ -191,42 +187,39 @@ Allowed atomic commands:
     scan [area/surface]     — VLM perceives the area and returns a list of
                               visible objects; NO robot motion occurs
     pick up [object]        — grasp and lift the object from the surface
-    place [object] in the left basket   — move object to the left basket and release
-    place [object] in the right basket  — move object to the right basket and release
+    place it in the basket  — move object to the basket and release
 
 REPEAT…UNTIL format (use EXACTLY this):
 REPEAT:
   1. scan [area]
   2. pick up the nearest visible [object type]
-  3. place the [object type] in the left basket
+  3. place it in the basket
 UNTIL: [natural-language termination condition verifiable from a camera image]
 
 Rules:
 - Use REPEAT…UNTIL when the number of objects is unknown or variable.
 - The UNTIL condition MUST be checkable from a camera image
   (e.g. "no vegetables remain on the table", "the table is clear").
-- For the place step, choose "left basket" or "right basket" based on the
-  object's position: objects on the left side of the table go to the left
-  basket; objects on the right side go to the right basket. When position is
-  unknown at plan time, default to "left basket".
+- The place step is always "place it in the basket" — do NOT specify the
+  object name or basket direction in the place command.
 - Do NOT enumerate individual objects — use the loop instead.
-- Do NOT use `pick from`, `deposit into`, `move to`, or `place in the basket`
-  (always specify left or right).
+- Do NOT use `pick from`, `deposit into`, `move to`, or directional basket
+  references like "left basket" / "right basket".
 - The scan step discovers which specific object to pick next; the subsequent
   pick up step uses that information.
 
-Example for "put all the vegetables on the table into the baskets":
+Example for "put all the vegetables on the table into the basket":
 REPEAT:
   1. scan the table
   2. pick up the nearest visible vegetable on the table
-  3. place the vegetable in the left basket
+  3. place it in the basket
 UNTIL: no vegetables remain on the table
 
-Example for "clear all objects from the table and put them in the baskets":
+Example for "clear all objects from the table":
 REPEAT:
   1. scan the table
   2. pick up the nearest visible object on the table
-  3. place the object in the left basket
+  3. place it in the basket
 UNTIL: no objects remain on the table
 
 Task: {task}

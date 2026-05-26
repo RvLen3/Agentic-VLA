@@ -135,40 +135,33 @@ def build_instruction(task_type: str, fruit_type: str, basket_side: str = "left"
     """
     生成标准化指令字符串（Requirement 1.6）。
 
-    根据原子操作类型、蔬菜类型和篮子位置，生成用于 VLA 训练的标准化语言指令。
-    指令格式与 data/dataset.py 中的 TASK_LIST 保持一致。
+    根据原子操作类型和蔬菜类型，生成用于 VLA 训练的标准化语言指令。
 
     Args:
         task_type: 原子操作类型，支持 'pick_up' 和 'place'。
         fruit_type: 蔬菜类型，如 'red pepper'、'corn' 等。
-        basket_side: 篮子位置，取值为 'left' 或 'right'，仅 place 操作使用。
+        basket_side: 已废弃，保留参数兼容性但不再使用。
 
     Returns:
         标准化指令字符串。
         - task_type='pick_up' -> 'pick up the {fruit_type}'
-        - task_type='place'   -> 'place the {fruit_type} in the {basket_side} basket'
+        - task_type='place'   -> 'place it in the basket'
 
     Raises:
         ValueError: 当 task_type 不是 'pick_up' 或 'place' 时抛出。
-        ValueError: 当 basket_side 不是 'left' 或 'right' 时抛出。
 
     Examples:
         >>> build_instruction('pick_up', 'red pepper')
         'pick up the red pepper'
-        >>> build_instruction('place', 'corn', 'left')
-        'place the corn in the left basket'
+        >>> build_instruction('place', 'corn')
+        'place it in the basket'
         >>> build_instruction('place', 'pumpkin', 'right')
-        'place the pumpkin in the right basket'
+        'place it in the basket'
     """
     if task_type == "pick_up":
         return f"pick up the {fruit_type}"
     elif task_type == "place":
-        if basket_side not in BASKET_SIDES:
-            raise ValueError(
-                f"不支持的 basket_side: '{basket_side}'。"
-                f"有效值为: {BASKET_SIDES}"
-            )
-        return f"place the {fruit_type} in the {basket_side} basket"
+        return "place it in the basket"
     else:
         raise ValueError(
             f"不支持的 task_type: '{task_type}'。"
