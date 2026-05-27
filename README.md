@@ -30,6 +30,9 @@ Long-horizon robotic manipulation poses significant challenges for autonomous sy
     - **`mapping.py`**：动作空间映射模块，定义 VLA 模型输出与 UR 机械臂控制指令之间的转换逻辑。
     - **`calibrate_mapping.py`**：映射标定工具，通过采集标定数据自动计算最优映射参数。
 
+- **[2026/05/27]**
+  - 优化了**dataset.py**文件,修改了其远程控制协议,从RCTD修改为XML，实现了通过键盘控制机械臂移动和夹爪的开闭,无需手动标记夹爪状态.
+  - 优化了坐标系映射逻辑,目前基本实现输入指令与真实世界坐标系的对齐.
 
 
 ## ✨ News ✨

@@ -81,8 +81,8 @@ ROT_STEP   = 0.01     # 每帧旋转增量 (rad)，0.01rad * 30fps ≈ 0.3rad/s
 
 # 坐标映射
 MAP_ROTATION_DEG = 100.0
-MAP_TILT_DEG     = -36.0
-MAP_XY_ROT_DEG   = 36.0
+MAP_TILT_DEG     = 35
+MAP_XY_ROT_DEG   = 30
 
 def get_teleop_rotation(theta_deg, tilt_deg, xy_rot_deg):
     theta, tilt, phi = np.radians([theta_deg, tilt_deg, xy_rot_deg])
