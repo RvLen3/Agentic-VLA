@@ -120,10 +120,12 @@ class RobotXMLRPCController:
         # [x, y, z, rx, ry, rz, gripper_pos]
         self._target = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 100.0]
         self._server = None
+        self._connected = False  # UR 程序是否已成功调用过 get_target
 
     def _get_target(self):
         """XML-RPC 方法，UR 程序每 10ms 调用。必须返回 Python 原生 float 列表。"""
         with self._lock:
+            self._connected = True
             return [float(v) for v in self._target]
 
     def start(self) -> bool:
@@ -192,6 +194,19 @@ class RobotXMLRPCController:
         if self._server:
             self._server.shutdown()
             print("  [XMLRPC] 服务器已停止")
+
+    def wait_for_connection(self, timeout=30):
+        """等待 UR 程序首次成功调用 get_target()。"""
+        print(f"  [XMLRPC] 等待 UR 程序连接（最多 {timeout}s）...")
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            with self._lock:
+                if self._connected:
+                    print("  [XMLRPC] UR 程序已连接！")
+                    return True
+            time.sleep(0.1)
+        print("  [XMLRPC] 超时！请确认示教器 xvla control program 正在运行")
+        return False
 
 
 # ============ 工具函数 ============
@@ -370,6 +385,8 @@ def main():
         controller = RobotXMLRPCController(XMLRPC_SERVER_IP, XMLRPC_SERVER_PORT, ROBOT_IP)
         if not controller.start():
             raise RuntimeError("XML-RPC 控制器启动失败")
+        if not controller.wait_for_connection():
+            raise RuntimeError("UR 程序未连接，请检查示教器")
 
         gripper_state = 0.0
         controller.gripper_close()
