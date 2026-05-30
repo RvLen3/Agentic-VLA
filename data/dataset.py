@@ -17,9 +17,7 @@ UR7e 左臂 键盘控制示教数据采集
 键盘映射：
   W/S      → 前进/后退       R/F      → 上升/下降
   A/D      → 左移/右移
-  O/K      → 左旋/右旋 (yaw)
-  P/L      → 前倾/后仰 (pitch)
-  M/N      → 手爪正旋/反旋 (roll)
+  M/N      → 左旋/右旋 (yaw)
   G        → 夹爪开/闭（按一次切换）
   Q        → 结束当前轨迹并保存
   松手即停（无按键时不更新目标位姿）
@@ -60,7 +58,7 @@ ROBOT_IP = "192.168.1.88"
 
 # XML-RPC 服务器（本机，UR 程序连接的地址）
 XMLRPC_SERVER_IP   = "192.168.1.100"
-XMLRPC_SERVER_PORT = 50000
+XMLRPC_SERVER_PORT = 40405
 
 SAVE_DIR = Path(f"./raw_demos_{ARM_NAME}_third")
 FPS = 30
@@ -99,6 +97,24 @@ def get_teleop_rotation(theta_deg, tilt_deg, xy_rot_deg):
     return np.column_stack([v_final, u_final, w_final])
 
 _MOUSE2ROBOT = get_teleop_rotation(MAP_ROTATION_DEG, MAP_TILT_DEG, MAP_XY_ROT_DEG)
+
+# 旋转映射（yaw-axis 方式，独立于位移映射）
+YAW_AXIS_RX = 10.0    # yaw 轴绕机器人 X 倾斜 (degrees)
+YAW_AXIS_RY = 25.0    # yaw 轴绕机器人 Y 倾斜 (degrees)
+
+def build_rot_from_yaw_axis(rx_tilt_deg, ry_tilt_deg):
+    c, s = np.cos, np.sin
+    rx, ry = np.radians([rx_tilt_deg, ry_tilt_deg])
+    yaw_axis = np.array([s(ry) * c(rx), -s(rx), c(ry) * c(rx)])
+    yaw_axis /= np.linalg.norm(yaw_axis)
+    ref = np.array([0, 0, 1]) if abs(yaw_axis[2]) < 0.999 else np.array([1, 0, 0])
+    pitch_axis = np.cross(yaw_axis, ref)
+    pitch_axis /= np.linalg.norm(pitch_axis)
+    roll_axis = np.cross(pitch_axis, yaw_axis)
+    roll_axis /= np.linalg.norm(roll_axis)
+    return np.column_stack([roll_axis, pitch_axis, yaw_axis])
+
+_ROT_MATRIX = build_rot_from_yaw_axis(YAW_AXIS_RX, YAW_AXIS_RY)
 # ==============================
 
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -195,7 +211,7 @@ class RobotXMLRPCController:
             self._server.shutdown()
             print("  [XMLRPC] 服务器已停止")
 
-    def wait_for_connection(self, timeout=30):
+    def wait_for_connection(self, timeout=60):
         """等待 UR 程序首次成功调用 get_target()。"""
         print(f"  [XMLRPC] 等待 UR 程序连接（最多 {timeout}s）...")
         t0 = time.time()
@@ -396,8 +412,7 @@ def main():
         print("UR7e 键盘控制采集（XML-RPC 模式）")
         print("=" * 60)
         print("  W/S=前后  A/D=左右  R/F=上下")
-        print("  O/K=yaw  P/L=pitch  M/N=roll")
-        print("  G=夹爪切换  Q=结束录制")
+        print("  M/N=yaw  G=夹爪切换  Q=结束录制")
         print("  确保示教器 xvla control program 正在运行！")
         print("=" * 60)
 
@@ -428,7 +443,7 @@ def main():
                 rtde_r = reconnect_rtde(rtde_r)
                 controller.update_pose_from_robot()
 
-                print(">>> 录制中！WASD/RF=移动 OKPLMN=旋转 G=夹爪 Q=结束 <<<")
+                print(">>> 录制中！WASD/RF=移动 M/N=旋转 G=夹爪 Q=结束 <<<")
                 _setup_terminal()
 
                 images_main, images_wrist, depths_d405 = [], [], []
@@ -436,7 +451,7 @@ def main():
                 frame_count = 0
                 start_tcp = None
 
-                while frame_count < MAX_FRAMES:
+                while True:
                     loop_start = time.time()
 
                     # 读取状态
@@ -475,7 +490,7 @@ def main():
                     cv2.putText(disp_m, f"TCP:[{tcp[0]:.3f},{tcp[1]:.3f},{tcp[2]:.3f}]", (10,58), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,0), 1)
                     cv2.putText(disp_m, f"Gripper: {grip_str}", (10,85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, grip_color, 2)
                     cv2.putText(disp_m, f"Task: {task_instruction}", (10,115), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,200,255), 1)
-                    cv2.putText(disp_m, "WASD/RF OKPLMN G=grip Q=stop", (10,460), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,255), 1)
+                    cv2.putText(disp_m, "WASD/RF M/N G=grip Q=stop", (10,460), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,255), 1)
                     disp_w = frame_w.copy()
                     cv2.putText(disp_w, "Wrist", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
                     cv2.imshow("UR7e Collection", np.hstack([disp_m, disp_w]))
@@ -511,17 +526,13 @@ def main():
                     if 's' in keys: dy -= TRANS_STEP
                     if 'r' in keys: dz += TRANS_STEP
                     if 'f' in keys: dz -= TRANS_STEP
-                    if 'o' in keys: drz += ROT_STEP
-                    if 'k' in keys: drz -= ROT_STEP
-                    if 'p' in keys: dry += ROT_STEP
-                    if 'l' in keys: dry -= ROT_STEP
-                    if 'm' in keys: drx += ROT_STEP
-                    if 'n' in keys: drx -= ROT_STEP
+                    if 'm' in keys: drz += ROT_STEP
+                    if 'n' in keys: drz -= ROT_STEP
 
                     if dx or dy or dz or drx or dry or drz:
                         # 坐标映射
                         trans = _MOUSE2ROBOT @ np.array([dx, dy, dz])
-                        rot = _MOUSE2ROBOT @ np.array([drx, dry, drz])
+                        rot = _ROT_MATRIX @ np.array([drx, dry, drz])
                         controller.add_delta(*trans, *rot)
 
                     elapsed = time.time() - loop_start

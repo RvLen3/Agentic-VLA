@@ -81,6 +81,7 @@ htmlcov/
 *.log
 *.tmp
 *.temp
+*.cache
 logs/
 wandb/
 
@@ -127,7 +128,16 @@ secrets.json
 # 保留 data/ 目录下的 Python 脚本，忽略其生成的数据
 data/raw_demos*/
 data/training_data*/
+*.zip
 
 # 训练报告（运行时生成）
 training_report*.json
 eval_report*.json
+
+# ------------------------------------------------------------
+# X-VLA / HuggingFace 模型下载缓存（../.cache，由 finetune_xvla.py 设置）
+# 忽略体积庞大的下载内容，但保留占位文件以便目录存在
+# ------------------------------------------------------------
+!.cache/
+.cache/*
+!.cache/.gitkeep

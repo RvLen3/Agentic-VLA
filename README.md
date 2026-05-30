@@ -34,6 +34,31 @@ Long-horizon robotic manipulation poses significant challenges for autonomous sy
   - 优化了**dataset.py**文件,修改了其远程控制协议,从RCTD修改为XML，实现了通过键盘控制机械臂移动和夹爪的开闭,无需手动标记夹爪状态.
   - 优化了坐标系映射逻辑,目前基本实现输入指令与真实世界坐标系的对齐.
 
+- **[2026/05/29]**
+  - 完成了初步的数据采集，共获取约110条子任务数据
+  - 修改部分代码:
+    - **`finetune_xvla.py`**：微调底层控制模型VLA的脚本，设置了仅微调SoftPrompt(默认)、LoRA微调Backbone以及全量微调三种不同的微调方式。
+    - **`xvla_npz_dataset.py`**: 将npz数据转为X-VLA原生的EE6D(20dim)格式。
+  - 目前的数据输入是归一化的绝对TCP位姿以及旋转角，而非单步变化，后续需要对这方面进行修改，让模型去学习更容易学习的变化。
+    - 值得一提的是，TCP位姿可以用下一步减当前步作为变化幅度，而旋转角不能做简单的减法
+
+
+- **[2026/05/30]**
+  - 解决了部分环境依赖冲突,跑通了微调X-VLA SoftPrompt的demo.
+  - 解决了训练速度异常的问题,主要集中在数据读取方面,相关代码已在 **`xvla_npz_dataset.py`** 中进行修改 , 同时对微调代码进行了优化以适应上述修改.
+  - 考虑是否需要对原始数据进行相关处理,删掉一些没有动作的帧.
+  - 修改及新增部分代码
+    - **`finetune_xvla.py`**:
+      - 新增 evaluate():在验证集上跑(val_max_batches 限制条数),返回总 loss + 各分量。
+      - 训练循环里每 val_every_steps 跑一次验证,记录到 wandb 的 val/*。
+      - 早停:验证 loss 连续 early_stop_patience 次没提升(超过 early_stop_min_delta)就停。
+      - 新参数:--val_ratio 0.15、--val_every_steps 200、--early_stop_patience 10、--val_max_batches 50、--split_seed。
+      - 测试验证过:112 episode → 95 train / 17 val,无重叠、索引正确、batch 仍单 episode
+      - 优化了训练完成后模型参数的保存及命名逻辑
+    - **`visualize_predictions.py`**
+      - 加载 checkpoint(HF 目录,或 基础模型 + --pth 把可训练参数贴上去)。
+      - 取某条 episode 的某个起点,用 model.generate_actions 预测动作 chunk。
+      - 把预测和真值的 EE6D 解码成 xyz 位移 + 夹爪,画成对比图(累积轨迹、逐步增量、夹爪开合),并打印位置 MAE 和夹爪匹配率。
 
 ## ✨ News ✨
 
