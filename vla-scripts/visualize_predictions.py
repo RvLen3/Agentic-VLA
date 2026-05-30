@@ -138,10 +138,6 @@ def main():
     pos_pred, pos_gt = pred[:, ARM1_POS], gt[:, ARM1_POS]
     grip_pred, grip_gt = pred[:, ARM1_GRIPPER], gt[:, ARM1_GRIPPER]
 
-    # Cumulative position (relative chunk → trajectory) for readability
-    cum_pred = np.cumsum(pos_pred, axis=0)
-    cum_gt = np.cumsum(pos_gt, axis=0)
-
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -150,22 +146,26 @@ def main():
         print("matplotlib not installed: pip install matplotlib")
         # Fall back to a text summary
         mae = np.abs(pos_pred - pos_gt).mean()
-        print(f"position delta MAE: {mae:.5f} m | gripper match: "
+        print(f"position MAE: {mae:.5f} m | gripper match: "
               f"{(np.round(grip_pred) == np.round(grip_gt)).mean():.2f}")
         return
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     labels = ["x", "y", "z"]
+    # Actions are ABSOLUTE EEF positions → plot them directly (no cumsum).
     for i, lbl in enumerate(labels):
-        axes[0, 0].plot(cum_gt[:, i], label=f"gt {lbl}", linestyle="-")
-        axes[0, 0].plot(cum_pred[:, i], label=f"pred {lbl}", linestyle="--")
-    axes[0, 0].set_title("Cumulative position (relative to start)")
+        axes[0, 0].plot(pos_gt[:, i], label=f"gt {lbl}", linestyle="-")
+        axes[0, 0].plot(pos_pred[:, i], label=f"pred {lbl}", linestyle="--")
+    axes[0, 0].set_title("Absolute position (base frame)")
     axes[0, 0].set_xlabel("chunk step"); axes[0, 0].set_ylabel("metres"); axes[0, 0].legend(fontsize=8)
 
+    # Per-step movement (diff of absolute) — shows velocity profile.
+    dgt = np.diff(pos_gt, axis=0, prepend=pos_gt[:1])
+    dpred = np.diff(pos_pred, axis=0, prepend=pos_pred[:1])
     for i, lbl in enumerate(labels):
-        axes[0, 1].plot(pos_gt[:, i], label=f"gt Δ{lbl}", linestyle="-")
-        axes[0, 1].plot(pos_pred[:, i], label=f"pred Δ{lbl}", linestyle="--")
-    axes[0, 1].set_title("Per-step position delta")
+        axes[0, 1].plot(dgt[:, i], label=f"gt Δ{lbl}", linestyle="-")
+        axes[0, 1].plot(dpred[:, i], label=f"pred Δ{lbl}", linestyle="--")
+    axes[0, 1].set_title("Per-step movement (diff of absolute)")
     axes[0, 1].set_xlabel("chunk step"); axes[0, 1].set_ylabel("Δ metres"); axes[0, 1].legend(fontsize=8)
 
     axes[1, 0].plot(grip_gt, label="gt gripper", marker="o")
@@ -179,16 +179,16 @@ def main():
     axes[1, 1].text(0.05, 0.5,
                     f"episode: {args.episode}\nstart_t: {args.start_t}\n"
                     f"num_actions: {args.num_actions}\n\n"
-                    f"position Δ MAE: {pos_mae:.5f} m\n"
+                    f"position MAE: {pos_mae:.5f} m  (absolute)\n"
                     f"gripper match: {grip_acc:.2f}\n"
                     f"instruction:\n{item['instruction']}",
                     fontsize=11, va="center")
 
-    fig.suptitle(f"X-VLA predicted vs ground-truth action chunk")
+    fig.suptitle(f"X-VLA predicted vs ground-truth action chunk (absolute EEF)")
     fig.tight_layout()
     fig.savefig(args.out, dpi=120)
     print(f"[*] Saved plot → {args.out}")
-    print(f"    position Δ MAE: {pos_mae:.5f} m | gripper match: {grip_acc:.2f}")
+    print(f"    position MAE: {pos_mae:.5f} m | gripper match: {grip_acc:.2f}")
 
 
 if __name__ == "__main__":

@@ -40,7 +40,7 @@ torchrun \
     --max_steps 15000 \
     --save_steps 500 \
     --val_ratio 0.15 \
-    --val_every_steps 200 \
+    --val_every_steps 500 \
     --early_stop_patience 10 \
     --run_root_dir "runs/fruit_vla" \
     --wandb_project "fruit-clearing-vla" \

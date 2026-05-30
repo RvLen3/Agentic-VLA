@@ -60,6 +60,11 @@ Long-horizon robotic manipulation poses significant challenges for autonomous sy
       - 取某条 episode 的某个起点,用 model.generate_actions 预测动作 chunk。
       - 把预测和真值的 EE6D 解码成 xyz 位移 + 夹爪,画成对比图(累积轨迹、逐步增量、夹爪开合),并打印位置 MAE 和夹爪匹配率。
 
+## TODO
+- 去除无效帧并对比效果
+- 对比XVLA Soft Prompt参数微调,LoRA微调及全量微调的效果
+- 网格搜索参数
+
 ## ✨ News ✨
 
 - **[2025/06/22]** 🤖 We open-sourced Agentic Robot v1.0 — we’ll continue improving the project with new ideas and updates, so feel free to follow and ⭐️ Star us to stay in the loop! [Agentic Robot v1.0](https://github.com/Agentic-Robot/agentic-robot)
@@ -95,6 +100,11 @@ We evaluate the Agentic Robot on LIBERO benchmark with VLM (QwenVL-2.5) and VLA 
 Navigate to the evaluation directory:
 ```python
 cd ./experiments/robot/libero/
+```
+# Launch XVLA finetune
+
+```python
+bash vla-scripts/train_fruit_vla.sh raw_demos_left_third 1 soft_prompt
 ```
 
 # Launch LIBERO-Spatial evals

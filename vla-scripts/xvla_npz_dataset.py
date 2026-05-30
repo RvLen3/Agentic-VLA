@@ -20,30 +20,39 @@ Reference: modeling_xvla.py / action_hub.py (EE6DActionSpace) from the
 `2toINF/X-VLA-Pt` checkpoint.
 
 EE6D action layout (dim_action = 20):
-    arm-1 :  [ 0: 3] xyz position
-             [ 3: 9] 6D rotation (first two columns of the rotation matrix)
+    arm-1 :  [ 0: 3] xyz position (ABSOLUTE, in robot base frame, metres)
+             [ 3: 9] 6D rotation (ABSOLUTE: first two columns of the rotation matrix)
              [ 9   ] gripper (0 = open, 1 = closed)  ── trained with BCE
     arm-2 :  [10:13] xyz position
              [13:19] 6D rotation
              [19   ] gripper
     For a single-arm UR robot, arm-2 channels [10:20] are zero-padded.
 
-Action chunking:
+Action chunking (ABSOLUTE targets — matches official X-VLA convention):
     For each start timestep t the target is a chunk of `num_actions` future
-    steps (default 30). The pose at t+k is expressed *relative to the pose at t*:
-        Δposition   = p[t+k] - p[t]                      (metres)
-        rotation6D  = R6D( R[t]^{-1} @ R[t+k] )           (relative rotation)
-        gripper     = gripper[t+k]                        (absolute next state)
+    steps (default 30). Each step is the ABSOLUTE target end-effector pose:
+        position   = p[t+k]                              (absolute xyz, metres)
+        rotation6D = R6D( R[t+k] )                        (absolute rotation as 6D)
+        gripper    = gripper[t+k]                         (absolute next state)
     If fewer than `num_actions` steps remain, the last valid action is repeated
     (standard action-chunk padding).
+
+    IMPORTANT: X-VLA is trained on ABSOLUTE EEF actions, NOT deltas. The official
+    LIBERO preprocessing converts relative dataset actions into absolute EEF
+    poses before EE6D encoding, and the deployment controller runs with
+    `use_delta=False` (the predicted pose IS the controller goal). See:
+      https://github.com/2toinf/X-VLA/blob/main/evaluation/libero/preprocess.md
+      https://github.com/2toinf/X-VLA/blob/main/evaluation/libero/libero_client.py
+    Our raw_demos tcp_poses are already absolute (UR getActualTCPPose), so we use
+    them directly — no delta computation.
 
 NOTE on normalization:
     X-VLA does NOT use min/max action normalization. The EE6D action space
     applies fixed loss-weight *scales* (XYZ_SCALE=500, ROT_SCALE=10) internally,
     and the gripper is supervised with BCE on {0,1} targets. We therefore feed
-    RAW metric deltas + 6D rotations + {0,1} gripper. The only thing the
-    deployment side must reproduce is this exact EE6D encoding (and the inverse
-    `rotate6d_to_xyz` at inference) — there is no separate de-normalization step.
+    RAW absolute metric poses + 6D rotations + {0,1} gripper. At deployment the
+    predicted EE6D pose is converted back (rotate6d → axis-angle) and sent to the
+    controller directly as the absolute goal — there is no de-normalization step.
 """
 
 import glob
@@ -78,9 +87,13 @@ ARM1_GRIPPER = 9
 def _rotmat_to_6d(R: np.ndarray) -> np.ndarray:
     """
     Convert a 3x3 rotation matrix to the 6D representation of Zhou et al. (2019):
-    the first two columns of R, flattened column-major → 6 values.
+    the first two COLUMNS of R, concatenated → 6 values [r11,r21,r31, r12,r22,r32].
+
+    This matches the official X-VLA `Mat_to_Rotate6D` (libero_client.py):
+        concat([R[:3, 0], R[:3, 1]])
+    so checkpoints decode our actions with the same convention.
     """
-    return R[:, :2].T.reshape(-1).astype(np.float32)  # [r11,r21,r31, r12,r22,r32]
+    return np.concatenate([R[:3, 0], R[:3, 1]]).astype(np.float32)
 
 
 def _axisangle_to_rotmat(rvec: np.ndarray) -> np.ndarray:
@@ -96,45 +109,44 @@ def _axisangle_to_rotmat(rvec: np.ndarray) -> np.ndarray:
 
 def compute_dataset_statistics(npz_dir: str, num_actions: int = 30) -> Dict:
     """
-    Compute simple statistics over per-step position deltas and gripper usage.
-    These are informational only (X-VLA does not normalise with them) but are
-    saved alongside the checkpoint for reproducibility and sanity checking.
+    Compute simple statistics over ABSOLUTE end-effector positions and gripper
+    usage. These are informational only (X-VLA does not normalise with them) but
+    are saved alongside the checkpoint for reproducibility and sanity checking.
     """
     npz_files = sorted(glob.glob(os.path.join(npz_dir, "episode_*.npz")))
     if not npz_files:
         raise FileNotFoundError(f"No episode_*.npz files found in {npz_dir}")
 
-    all_dpos: List[np.ndarray] = []
+    all_pos: List[np.ndarray] = []
     grip_vals: List[np.ndarray] = []
     total_transitions = 0
 
     for fpath in npz_files:
         d = np.load(fpath, allow_pickle=True)
-        tcp = d["tcp_poses"].astype(np.float32)   # (T, 6)
+        tcp = d["tcp_poses"].astype(np.float32)   # (T, 6) absolute [x,y,z,rx,ry,rz]
         grip = d["gripper"].astype(np.float32)    # (T,)
         d.close()
 
         if tcp.shape[0] < 2:
             continue
-        dpos = tcp[1:, :3] - tcp[:-1, :3]
-        all_dpos.append(dpos)
+        all_pos.append(tcp[:, :3])                # absolute positions
         grip_vals.append(grip)
         total_transitions += tcp.shape[0] - 1
 
-    dpos_np = np.concatenate(all_dpos, axis=0) if all_dpos else np.zeros((1, 3), np.float32)
+    pos_np = np.concatenate(all_pos, axis=0) if all_pos else np.zeros((1, 3), np.float32)
     grip_np = np.concatenate(grip_vals, axis=0) if grip_vals else np.zeros((1,), np.float32)
 
     return {
-        "format": "xvla_ee6d",
+        "format": "xvla_ee6d_absolute",
         "dim_action": DIM_ACTION,
         "num_actions": num_actions,
-        "position_delta": {
-            "mean": dpos_np.mean(axis=0).tolist(),
-            "std": dpos_np.std(axis=0).tolist(),
-            "min": dpos_np.min(axis=0).tolist(),
-            "max": dpos_np.max(axis=0).tolist(),
-            "q01": np.percentile(dpos_np, 1, axis=0).tolist(),
-            "q99": np.percentile(dpos_np, 99, axis=0).tolist(),
+        "position_abs": {
+            "mean": pos_np.mean(axis=0).tolist(),
+            "std": pos_np.std(axis=0).tolist(),
+            "min": pos_np.min(axis=0).tolist(),
+            "max": pos_np.max(axis=0).tolist(),
+            "q01": np.percentile(pos_np, 1, axis=0).tolist(),
+            "q99": np.percentile(pos_np, 99, axis=0).tolist(),
         },
         "gripper": {
             "mean": float(grip_np.mean()),
@@ -282,10 +294,16 @@ class XVLANpzDataset(Dataset):
         # (not just this split) so train/val share the same reference numbers.
         if stats_path is None:
             stats_path = os.path.join(self.npz_dir, "xvla_dataset_statistics.json")
+        self.stats = None
         if os.path.exists(stats_path):
             with open(stats_path) as f:
-                self.stats = json.load(f)
-        else:
+                loaded = json.load(f)
+            # Recompute if the cached stats came from an older (delta) format.
+            if loaded.get("format") == "xvla_ee6d_absolute":
+                self.stats = loaded
+            else:
+                print(f"[XVLANpzDataset] stale stats format in {stats_path}; recomputing.")
+        if self.stats is None:
             self.stats = compute_dataset_statistics(self.npz_dir, self.num_actions)
             with open(stats_path, "w") as f:
                 json.dump(self.stats, f, indent=2)
@@ -367,21 +385,20 @@ class XVLANpzDataset(Dataset):
         if ep["images_wrist"] is not None:
             images.append(self._to_pil(ep["images_wrist"][t]))
 
-        # ── Current pose (proprio) in EE6D ─────────────────────────────
+        # ── Current pose (proprio) in EE6D — ABSOLUTE (base frame) ─────
         pos_t = pos[t]
         R_t = rotmats[t]
-        R_t_inv = R_t.T  # rotation matrix inverse = transpose
         proprio = self._ee6d_from_pose(pos_t, R_t, float(grip[t]))
 
-        # ── Action chunk: future steps relative to current pose ────────
+        # ── Action chunk: ABSOLUTE target poses (NOT deltas) ───────────
+        # X-VLA is trained on absolute EEF actions; the predicted pose is the
+        # controller goal directly (use_delta=False). See module docstring.
         action = np.zeros((self.num_actions, DIM_ACTION), dtype=np.float32)
         last_valid = None
         for k in range(self.num_actions):
             step = t + 1 + k
             if step < T:
-                dpos = pos[step] - pos_t
-                R_rel = R_t_inv @ rotmats[step]
-                vec = self._ee6d_from_pose(dpos, R_rel, float(grip[step]))
+                vec = self._ee6d_from_pose(pos[step], rotmats[step], float(grip[step]))
                 action[k] = vec
                 last_valid = vec
             else:
