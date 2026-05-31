@@ -103,6 +103,24 @@ def _axisangle_to_rotmat(rvec: np.ndarray) -> np.ndarray:
     return Rotation.from_rotvec(np.asarray(rvec, dtype=np.float64)).as_matrix()
 
 
+def _chunk_motion(pos: np.ndarray, t: int, num_actions: int, stride: int) -> float:
+    """
+    Total path length (metres) of the action chunk starting at t with the given
+    stride, measured on absolute xyz positions. Used to filter near-static chunks.
+        steps used = t+stride, t+2*stride, ... (num_actions of them, clipped to end)
+    """
+    T = pos.shape[0]
+    prev = pos[t]
+    total = 0.0
+    for k in range(num_actions):
+        step = t + (k + 1) * stride
+        if step >= T:
+            break
+        total += float(np.linalg.norm(pos[step] - prev))
+        prev = pos[step]
+    return total
+
+
 # ---------------------------------------------------------------------------
 # Statistics (lightweight: position-delta ranges only, for inspection/logging)
 # ---------------------------------------------------------------------------
@@ -230,6 +248,8 @@ class XVLANpzDataset(Dataset):
         cache_episodes: int = 2,
         episode_indices: Optional[List[int]] = None,
         split_tag: str = "all",
+        frame_stride: int = 1,
+        min_chunk_motion: float = 0.0,
     ):
         self.npz_dir = str(npz_dir)
         self.num_actions = int(num_actions)
@@ -238,6 +258,8 @@ class XVLANpzDataset(Dataset):
         self.resize_resolution = resize_resolution
         self.cache_episodes = int(cache_episodes)
         self.split_tag = split_tag
+        self.frame_stride = max(1, int(frame_stride))
+        self.min_chunk_motion = float(min_chunk_motion)
 
         npz_files = sorted(glob.glob(os.path.join(self.npz_dir, "episode_*.npz")))
         if not npz_files:
@@ -263,6 +285,8 @@ class XVLANpzDataset(Dataset):
         self._index: List[Tuple[int, int]] = []
         self._ep_lengths: Dict[int, int] = {}
         self._episode_spans: List[Tuple[int, int]] = []   # (start, end) into self._index
+        n_total_starts = 0
+        n_kept = 0
         for ep_idx in self._episode_indices:
             fpath = npz_files[ep_idx]
             key = os.path.basename(fpath)
@@ -275,9 +299,25 @@ class XVLANpzDataset(Dataset):
                 cached[key] = T
                 needs_save = True
             self._ep_lengths[ep_idx] = T
+
+            # If motion filtering is on, we need this episode's positions (cheap:
+            # tcp_poses is T x 6, ~KB — we do NOT decode the images here).
+            pos = None
+            if self.min_chunk_motion > 0.0:
+                d = np.load(fpath, allow_pickle=True)
+                pos = d["tcp_poses"][:, :3].astype(np.float32)
+                d.close()
+
             span_start = len(self._index)
+            # A start t is valid if at least the FIRST strided action step exists
+            # (t + frame_stride < T); remaining steps are pad-repeated if needed.
             for t in range(T - 1):
+                n_total_starts += 1
+                if pos is not None:
+                    if _chunk_motion(pos, t, self.num_actions, self.frame_stride) < self.min_chunk_motion:
+                        continue  # skip near-static chunk
                 self._index.append((ep_idx, t))
+                n_kept += 1
             self._episode_spans.append((span_start, len(self._index)))
 
         if needs_save:
@@ -311,9 +351,13 @@ class XVLANpzDataset(Dataset):
         print(
             f"[XVLANpzDataset:{self.split_tag}] {len(self._episode_indices)} episodes, "
             f"{len(self._index)} chunk-starts, num_actions={self.num_actions}, "
+            f"stride={self.frame_stride}, min_chunk_motion={self.min_chunk_motion}, "
             f"domain_id={self.domain_id}, wrist={self.use_wrist_image}, "
             f"cache_episodes={self.cache_episodes}"
         )
+        if self.min_chunk_motion > 0.0:
+            kept_pct = 100.0 * n_kept / max(1, n_total_starts)
+            print(f"    motion filter kept {n_kept}/{n_total_starts} starts ({kept_pct:.1f}%)")
 
     def __len__(self) -> int:
         return len(self._index)
@@ -393,10 +437,12 @@ class XVLANpzDataset(Dataset):
         # ── Action chunk: ABSOLUTE target poses (NOT deltas) ───────────
         # X-VLA is trained on absolute EEF actions; the predicted pose is the
         # controller goal directly (use_delta=False). See module docstring.
+        # frame_stride sub-samples future steps so a chunk covers more real
+        # motion (helps when data is recorded at high fps with little movement).
         action = np.zeros((self.num_actions, DIM_ACTION), dtype=np.float32)
         last_valid = None
         for k in range(self.num_actions):
-            step = t + 1 + k
+            step = t + (k + 1) * self.frame_stride
             if step < T:
                 vec = self._ee6d_from_pose(pos[step], rotmats[step], float(grip[step]))
                 action[k] = vec

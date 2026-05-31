@@ -11,9 +11,13 @@ Fine-tuning script for X-VLA models with THREE selectable strategies
        recipe: adapt to a new robot (your UR7E) by learning a fresh prompt while
        the pretrained backbone stays frozen. ~1% of params, best for few demos.
 
-  2. "lora" — Parameter-efficient backbone tuning via HuggingFace PEFT.
-       Backbone weights stay frozen; low-rank LoRA adapters are injected into the
-       linear layers. The soft prompts are trained alongside the adapters.
+  2. "lora" — Official X-VLA fine-tuning recipe (recommended for a new robot).
+       Injects LoRA adapters into all linear layers AND fully trains the
+       "Action Expert" (transformer.action_encoder + transformer.action_decoder)
+       together with the soft prompt hub, via PEFT `modules_to_save`. Optionally
+       warms up the action expert first (freeze_steps) before ramping the LoRA
+       adapters. This mirrors official_ft_xvla.py from the X-VLA repo and gives
+       the model enough capacity to remap vision→action for a new embodiment.
 
   3. "full" — Full fine-tuning of every parameter. Following the official recipe,
        VLM (vision-language) layers use 1/10 of the base LR (--vlm_lr_scale) for
@@ -66,6 +70,7 @@ Notes:
 """
 
 import os
+import math
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -134,6 +139,8 @@ class XVLAFinetuneConfig:
     domain_id: int = 3                                         # Soft-prompt / embodiment index (3 = LIBERO/Franka EE6D)
     num_actions: int = 30                                      # Action chunk length (X-VLA config: num_actions)
     use_wrist_image: bool = True                               # Feed wrist camera as a 2nd view (images_wrist)
+    frame_stride: int = 1                                      # Sub-sample future steps in each action chunk (1 = every frame)
+    min_chunk_motion: float = 0.0                              # Skip chunk-starts whose total path < this (m); 0 = keep all
 
     # Training hyperparameters
     batch_size: int = 8                                        # Per-GPU batch size
@@ -146,6 +153,14 @@ class XVLAFinetuneConfig:
     group_by_episode: bool = True                              # Batch within one episode (maximizes cache hits → big speedup)
     save_latest_checkpoint_only: bool = True                   # Overwrite latest checkpoint vs. keep all
 
+    # ── LR schedule (official X-VLA: linear warmup → cosine decay) ────────
+    # Stabilises training when fully training the action expert; without it the
+    # large-capacity groups can oscillate (position_loss spiking).
+    use_lr_schedule: bool = True                               # Enable warmup + (optional) cosine decay
+    warmup_steps: int = 1000                                   # Linear warmup length (gradient steps)
+    use_cosine_decay: bool = True                              # Cosine-decay after warmup (else hold flat)
+    min_lr_ratio: float = 0.1                                  # Cosine floor as a fraction of base LR
+
     # ── Validation & early stopping (recommended for small datasets) ──────
     val_ratio: float = 0.15                                    # Fraction of EPISODES held out for validation (0 = disable)
     val_every_steps: int = 200                                 # Run validation every N gradient steps
@@ -157,6 +172,7 @@ class XVLAFinetuneConfig:
     # ── Checkpoint export ────────────────────────────────────────────────
     save_pth: bool = True                                      # Save lightweight .pth (trainable params + metadata)
     export_hf_on_finish: bool = True                           # Also export a full HF model dir at the end (for deployment)
+    export_best_hf: bool = True                                # Snapshot the best-val model and export it as a merged HF dir (best_hf/)
 
     # ── Fine-tuning strategy ─────────────────────────────────────────────
     # Choose ONE of three modes:
@@ -166,8 +182,10 @@ class XVLAFinetuneConfig:
     #                   params); best fit for adapting to ONE new robot (UR7E)
     #                   with limited demos. Only the soft-prompt row indexed by
     #                   `domain_id` actually receives gradients.
-    #   "lora"        : keep backbone frozen, inject LoRA adapters into its
-    #                   linear layers; soft prompts are trained alongside.
+    #   "lora"        : official X-VLA recipe — inject LoRA adapters into all
+    #                   linear layers AND fully train the Action Expert
+    #                   (action_encoder + action_decoder) + soft prompts. An
+    #                   optional freeze phase warms up the action expert first.
     #   "full"        : train every parameter. VLM (vision-language) layers use
     #                   a reduced LR (vlm_lr_scale x lr) per the official recipe.
     finetune_mode: str = "soft_prompt"                         # {"soft_prompt", "lora", "full"}
@@ -189,10 +207,22 @@ class XVLAFinetuneConfig:
     vlm_lr_scale: float = 0.1                                  # [full mode] VLM LR multiplier (official recipe = 1/10)
 
     # LoRA (used only when finetune_mode == "lora")
-    lora_rank: int = 32                                        # LoRA rank
+    # Official X-VLA recipe: LoRA on all-linear + FULLY train the action expert
+    # (action_encoder + action_decoder) and the soft prompts via `modules_to_save`.
+    lora_rank: int = 8                                         # LoRA rank (official default = 8)
+    lora_alpha: int = 16                                       # LoRA alpha (official default = 16)
     lora_dropout: float = 0.0                                  # LoRA dropout
     lora_target_modules: str = "all-linear"                    # LoRA target modules spec
     use_quantization: bool = False                             # 4-bit quantization (reduces VRAM, may hurt quality)
+    # Modules fully trained alongside LoRA (PEFT modules_to_save). The action
+    # expert = action_encoder + action_decoder; soft_prompt_hub = embodiment prompt.
+    train_action_expert: bool = True                           # [lora] also fully-train the action expert + soft prompts
+    action_expert_modules: str = "transformer.soft_prompt_hub,transformer.action_encoder,transformer.action_decoder"
+    # Freeze schedule (official): for the first `freeze_steps` gradient steps the
+    # LoRA adapters are held at lr=0 so the action expert + soft prompt warm up
+    # first; afterwards the adapters train at full LR. 0 = no freeze phase.
+    freeze_steps: int = 0
+    max_grad_norm: float = 1.0                                 # Gradient clipping (0 = disabled)
 
     # Derived from finetune_mode — do NOT set manually (overwritten in __post_init__).
     use_lora: bool = True
@@ -337,6 +367,31 @@ def reduce_loss_dict(loss_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
     return total
 
 
+def lr_at_step(step: int, base_lr: float, cfg: "XVLAFinetuneConfig", freeze_until: int = 0) -> float:
+    """
+    Per-step learning rate following the official X-VLA schedule:
+      - while step < freeze_until            → 0 (group is frozen)
+      - linear warmup over `warmup_steps`    → ramp 0 → base_lr
+      - then cosine decay to base_lr*min_lr_ratio (if use_cosine_decay) else hold
+
+    The warmup/decay clock starts at `freeze_until` so a group that unfreezes
+    later still gets its own warmup ramp.
+    """
+    if not cfg.use_lr_schedule:
+        return 0.0 if step < freeze_until else base_lr
+    if step < freeze_until:
+        return 0.0
+    progress = step - freeze_until
+    if progress < cfg.warmup_steps:
+        return base_lr * (progress / max(1, cfg.warmup_steps))
+    if not cfg.use_cosine_decay:
+        return base_lr
+    remain = max(1, cfg.max_steps - (freeze_until + cfg.warmup_steps))
+    frac = min(1.0, (progress - cfg.warmup_steps) / remain)
+    cos = 0.5 * (1.0 + math.cos(math.pi * frac))
+    return base_lr * (cfg.min_lr_ratio + (1.0 - cfg.min_lr_ratio) * cos)
+
+
 @torch.no_grad()
 def evaluate(model, val_loader, device_id, cfg) -> Dict[str, float]:
     """
@@ -419,6 +474,67 @@ def save_pth_checkpoint(model, cfg, run_dir: Path, step: int, loss: float,
     return fpath
 
 
+def save_loss_history(history: Dict, run_dir: Path) -> None:
+    """
+    Dump the recorded loss history to JSON and render a loss-curve PNG.
+
+    Produces:
+      <run_dir>/loss_history.json
+      <run_dir>/loss_curve.png   (train vs val total loss + per-component panels)
+    """
+    import json
+    # Raw data always saved (so curves can be re-plotted later without re-training).
+    with open(run_dir / "loss_history.json", "w") as f:
+        json.dump(history, f, indent=2)
+    print(f"  -> Saved loss history → {run_dir / 'loss_history.json'}")
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("  (matplotlib not installed → skipping loss_curve.png; JSON still saved)")
+        return
+
+    comp_names = sorted(set(history["train_components"]) | set(history["val_components"]))
+    n_panels = 1 + len(comp_names)
+    ncols = 2
+    nrows = (n_panels + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4 * nrows), squeeze=False)
+    axes = axes.flatten()
+
+    # Panel 0: total loss
+    ax = axes[0]
+    if history["train_step"]:
+        ax.plot(history["train_step"], history["train_loss"], label="train", color="tab:blue")
+    if history["val_step"]:
+        ax.plot(history["val_step"], history["val_loss"], label="val", color="tab:orange", marker="o", ms=3)
+    ax.set_title("total loss"); ax.set_xlabel("gradient step"); ax.set_ylabel("loss")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    # Per-component panels
+    for i, name in enumerate(comp_names):
+        ax = axes[i + 1]
+        tr = history["train_components"].get(name, [])
+        va = history["val_components"].get(name, [])
+        if tr:
+            ax.plot([s for s, _ in tr], [v for _, v in tr], label="train", color="tab:blue")
+        if va:
+            ax.plot([s for s, _ in va], [v for _, v in va], label="val", color="tab:orange", marker="o", ms=3)
+        ax.set_title(name); ax.set_xlabel("gradient step"); ax.set_ylabel("loss")
+        ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    # Hide any unused panels
+    for j in range(n_panels, len(axes)):
+        axes[j].axis("off")
+
+    fig.suptitle("X-VLA fine-tuning loss curves")
+    fig.tight_layout()
+    fig.savefig(run_dir / "loss_curve.png", dpi=120)
+    plt.close(fig)
+    print(f"  -> Saved loss curve → {run_dir / 'loss_curve.png'}")
+
+
 def save_checkpoint(
     vla,
     processor,
@@ -463,6 +579,55 @@ def save_checkpoint(
     dist.barrier()
 
 
+def snapshot_best_adapter(vla, cfg: XVLAFinetuneConfig, best_dir: Path, distributed_state):
+    """
+    Save the CURRENT model state as the 'best' snapshot (main process only).
+      - lora mode : save the PEFT adapter (small) → merged later into best_hf/.
+      - else      : save the full HF model directly into best_dir.
+    Called whenever validation improves, so best_dir always holds the best model.
+    """
+    if not distributed_state.is_main_process:
+        return
+    best_dir = Path(best_dir)
+    best_dir.mkdir(parents=True, exist_ok=True)
+    vla.module.save_pretrained(str(best_dir))
+
+
+def export_best_hf(processor, cfg: XVLAFinetuneConfig, best_adapter_dir: Path,
+                   best_hf_dir: Path, distributed_state):
+    """
+    Produce a deployment-ready HF model dir for the best snapshot.
+      - lora mode : reload base + merge the best adapter → save merged model.
+      - else      : the best snapshot IS already a full HF model → copy/save.
+    After this, evaluate with `--model_path <best_hf_dir>` and NO `--pth`.
+    """
+    if not distributed_state.is_main_process:
+        return
+    best_adapter_dir = Path(best_adapter_dir)
+    best_hf_dir = Path(best_hf_dir)
+    if not best_adapter_dir.exists():
+        print(f"[best] no best snapshot at {best_adapter_dir}; skipping best_hf export.")
+        return
+    best_hf_dir.mkdir(parents=True, exist_ok=True)
+
+    if cfg.use_lora:
+        base_model = AutoModel.from_pretrained(
+            cfg.pretrained_checkpoint, torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True, trust_remote_code=True,
+        )
+        merged = PeftModel.from_pretrained(base_model, str(best_adapter_dir)).merge_and_unload()
+        merged.save_pretrained(str(best_hf_dir))
+    else:
+        # best snapshot is already a full HF model; just (re)save under best_hf.
+        m = AutoModel.from_pretrained(
+            str(best_adapter_dir), torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True, trust_remote_code=True,
+        )
+        m.save_pretrained(str(best_hf_dir))
+    processor.save_pretrained(str(best_hf_dir))
+    print(f"  -> Exported BEST merged HF model → {best_hf_dir}  (eval with --model_path this, no --pth)")
+
+
 # ---------------------------------------------------------------------------
 # Main fine-tuning loop
 # ---------------------------------------------------------------------------
@@ -487,6 +652,8 @@ def finetune(cfg: XVLAFinetuneConfig) -> None:
     exp_id = build_exp_id(cfg)
     run_dir = cfg.run_root_dir / exp_id
     adapter_dir = cfg.adapter_tmp_dir / exp_id
+    best_adapter_dir = cfg.adapter_tmp_dir / (exp_id + "--best")   # best snapshot (adapter or full)
+    best_hf_dir = run_dir / "best_hf"                              # deployable merged best model
     os.makedirs(run_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -534,25 +701,53 @@ def finetune(cfg: XVLAFinetuneConfig) -> None:
     #   - "full"        : train everything (VLM at reduced LR)
     # ------------------------------------------------------------------
     param_groups = None
+    lora_param_group_names = None   # set in lora mode → used for the freeze schedule
     if cfg.finetune_mode == "lora":
+        # ── Official X-VLA recipe ─────────────────────────────────────
+        # LoRA on all-linear layers + FULLY train the action expert
+        # (action_encoder + action_decoder) and the soft prompt hub via
+        # PEFT `modules_to_save`. These three modules are the parts that carry
+        # embodiment-specific behaviour, so full-training them (not just LoRA)
+        # is what lets X-VLA actually adapt its action output to a new robot.
+        modules_to_save = [m.strip() for m in cfg.action_expert_modules.split(",") if m.strip()] \
+            if cfg.train_action_expert else None
         lora_config = LoraConfig(
             r=cfg.lora_rank,
-            lora_alpha=min(cfg.lora_rank, 16),
+            lora_alpha=cfg.lora_alpha,
             lora_dropout=cfg.lora_dropout,
+            bias="none",
             target_modules=cfg.lora_target_modules,
-            init_lora_weights="gaussian",
+            modules_to_save=modules_to_save,
         )
         model = get_peft_model(model, lora_config)
-        # Also keep the embodiment soft prompts trainable alongside LoRA adapters.
-        sp_patterns = [p.strip().lower() for p in cfg.soft_prompt_name_patterns.split(",") if p.strip()]
-        n_sp = 0
-        for name, p in model.named_parameters():
-            if _match_any(name, sp_patterns):
-                p.requires_grad = True
-                n_sp += p.numel()
         if distributed_state.is_main_process:
             model.print_trainable_parameters()
-            print(f"[lora] + soft-prompt params kept trainable: {n_sp/1e6:.3f}M")
+
+        # Build 2 param groups so we can (a) give soft-prompt/action-expert a
+        # possibly different LR and (b) freeze the LoRA adapters during warmup.
+        # PEFT names: LoRA tensors contain ".lora_"; the fully-trained
+        # modules_to_save tensors contain ".modules_to_save".
+        lora_params, save_params = [], []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if ".lora_" in name:
+                lora_params.append(p)
+            else:
+                # modules_to_save copies (action expert + soft prompts)
+                save_params.append(p)
+        param_groups = [
+            {"name": "lora_adapters", "params": lora_params, "lr": cfg.learning_rate},
+            {"name": "action_expert", "params": save_params, "lr": cfg.learning_rate},
+        ]
+        lora_param_group_names = ["lora_adapters"]
+        if distributed_state.is_main_process:
+            n_lora = sum(p.numel() for p in lora_params)
+            n_save = sum(p.numel() for p in save_params)
+            print(f"[lora] LoRA adapters: {n_lora/1e6:.3f}M | action-expert+soft-prompt "
+                  f"(full): {n_save/1e6:.3f}M")
+            if cfg.freeze_steps > 0:
+                print(f"[lora] freeze schedule: LoRA held at lr=0 for first {cfg.freeze_steps} steps")
     else:
         # soft_prompt / full: select trainable params by name and build LR groups
         param_groups = configure_trainable_parameters(
@@ -565,15 +760,18 @@ def finetune(cfg: XVLAFinetuneConfig) -> None:
     model = DDP(model, device_ids=[device_id], find_unused_parameters=False, gradient_as_bucket_view=True)
 
     # ------------------------------------------------------------------
-    # Optimizer
+    # Optimizer (all modes now use explicit param groups)
     # ------------------------------------------------------------------
-    if param_groups is not None:
-        # soft_prompt / full mode: use the (possibly multi-LR) param groups
-        optimizer = AdamW(param_groups, lr=cfg.learning_rate)
-    else:
-        # lora mode: a single group of all trainable (adapter + soft-prompt) params
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-        optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
+    optimizer = AdamW(param_groups, lr=cfg.learning_rate)
+    # Per-group schedule metadata: base (target) LR + the step until which the
+    # group is frozen. Only the LoRA adapter group has a freeze phase.
+    lora_names = set(lora_param_group_names or [])
+    for g in optimizer.param_groups:
+        g["base_lr"] = g["lr"]
+        g["freeze_until"] = cfg.freeze_steps if g["name"] in lora_names else 0
+    # Initialise LR at step 0 according to the schedule (warmup starts at 0).
+    for g in optimizer.param_groups:
+        g["lr"] = lr_at_step(0, g["base_lr"], cfg, g["freeze_until"])
 
     # ------------------------------------------------------------------
     # Dataset & DataLoader (X-VLA-native EE6D flow-matching inputs)
@@ -597,6 +795,8 @@ def finetune(cfg: XVLAFinetuneConfig) -> None:
         cache_episodes    = cfg.cache_episodes,
         episode_indices   = train_eps,
         split_tag         = "train",
+        frame_stride      = cfg.frame_stride,
+        min_chunk_motion  = cfg.min_chunk_motion,
     )
     val_dataset = None
     if val_eps:
@@ -609,6 +809,8 @@ def finetune(cfg: XVLAFinetuneConfig) -> None:
             cache_episodes    = cfg.cache_episodes,
             episode_indices   = val_eps,
             split_tag         = "val",
+            frame_stride      = cfg.frame_stride,
+            min_chunk_motion  = cfg.min_chunk_motion,
         )
 
     if distributed_state.is_main_process:
@@ -681,6 +883,15 @@ def finetune(cfg: XVLAFinetuneConfig) -> None:
     recent_losses = deque(maxlen=10 * cfg.grad_accumulation_steps)
     recent_components: Dict[str, deque] = {}
 
+    # Loss history for end-of-training curve plotting (main process only).
+    # Each entry: (gradient_step, value). Components keep their own series.
+    history = {
+        "train_step": [], "train_loss": [],
+        "train_components": {},               # name -> list[(step, val)]
+        "val_step": [], "val_loss": [],
+        "val_components": {},                 # name -> list[(step, val)]
+    }
+
     # Early-stopping / best-checkpoint state (driven by validation loss).
     best_val_loss = float("inf")
     best_step = -1
@@ -696,6 +907,13 @@ def finetune(cfg: XVLAFinetuneConfig) -> None:
         if distributed_state.is_main_process:
             wandb.log({f"val/{k}": v for k, v in val_metrics.items()}, step=gstep)
             print(f"[val] step {gstep}: " + ", ".join(f"{k}={v:.4f}" for k, v in val_metrics.items()))
+            # Record val history for the final loss curve.
+            history["val_step"].append(gstep)
+            history["val_loss"].append(val_metrics["loss"])
+            for k, v in val_metrics.items():
+                if k == "loss":
+                    continue
+                history["val_components"].setdefault(k, []).append((gstep, v))
 
         val_loss = val_metrics["loss"]
         improved = val_loss < (best_val_loss - cfg.early_stop_min_delta)
@@ -706,6 +924,10 @@ def finetune(cfg: XVLAFinetuneConfig) -> None:
             if distributed_state.is_main_process and cfg.save_pth:
                 save_pth_checkpoint(model, cfg, run_dir, gstep, val_loss,
                                     kind="best", val_metrics=val_metrics)
+            # Snapshot the deployable best model (adapter for lora, full otherwise).
+            if cfg.export_best_hf:
+                snapshot_best_adapter(model, cfg, best_adapter_dir, distributed_state)
+            dist.barrier()
         else:
             evals_since_improve += 1
             if cfg.early_stop_patience > 0 and evals_since_improve >= cfg.early_stop_patience:
@@ -772,6 +994,18 @@ def finetune(cfg: XVLAFinetuneConfig) -> None:
                 is_step_boundary = (batch_idx + 1) % cfg.grad_accumulation_steps == 0
 
                 if is_step_boundary:
+                    # Per-group LR schedule (official X-VLA: warmup → cosine),
+                    # with the LoRA group additionally frozen for `freeze_steps`.
+                    # Stabilises full action-expert training (prevents position
+                    # loss from oscillating).
+                    for g in optimizer.param_groups:
+                        g["lr"] = lr_at_step(gradient_step_idx, g["base_lr"], cfg, g["freeze_until"])
+                    # Gradient clipping (official default max_grad_norm=1.0).
+                    if cfg.max_grad_norm and cfg.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            (p for p in model.parameters() if p.requires_grad),
+                            cfg.max_grad_norm,
+                        )
                     optimizer.step()
                     optimizer.zero_grad()
                     progress.update()
@@ -783,8 +1017,18 @@ def finetune(cfg: XVLAFinetuneConfig) -> None:
                     log_data = {"train/loss": sum(recent_losses) / len(recent_losses)}
                     for k, dq in recent_components.items():
                         log_data[f"train/{k}"] = sum(dq) / len(dq)
+                    # Log current per-group LRs so the warmup/cosine schedule is visible.
+                    for g in optimizer.param_groups:
+                        log_data[f"lr/{g['name']}"] = g["lr"]
                     wandb.log(log_data, step=gradient_step_idx)
                     progress.set_postfix(loss=log_data["train/loss"], epoch=epoch)
+                    # Record train history for the final loss curve.
+                    history["train_step"].append(gradient_step_idx)
+                    history["train_loss"].append(log_data["train/loss"])
+                    for k, dq in recent_components.items():
+                        history["train_components"].setdefault(k, []).append(
+                            (gradient_step_idx, sum(dq) / len(dq))
+                        )
 
                 # ----------------------------------------------------------------
                 # Validation + best-checkpoint + early stop
@@ -823,11 +1067,22 @@ def finetune(cfg: XVLAFinetuneConfig) -> None:
         final_val = evaluate(model, val_loader, device_id, cfg)
         if final_val and distributed_state.is_main_process:
             print(f"[val] final: " + ", ".join(f"{k}={v:.4f}" for k, v in final_val.items()))
+            history["val_step"].append(final_step)
+            history["val_loss"].append(final_val["loss"])
+            for k, v in final_val.items():
+                if k != "loss":
+                    history["val_components"].setdefault(k, []).append((final_step, v))
     if distributed_state.is_main_process and cfg.save_pth:
         save_pth_checkpoint(model, cfg, run_dir, final_step, last_train_loss, kind="final")
         if best_step >= 0:
             print(f"Best val loss {best_val_loss:.4f} at step {best_step} "
                   f"(see pth/XVLA_{cfg.finetune_mode}_best.pth)")
+
+    # ------------------------------------------------------------------
+    # Save loss history + render loss curve
+    # ------------------------------------------------------------------
+    if distributed_state.is_main_process:
+        save_loss_history(history, run_dir)
 
     # ------------------------------------------------------------------
     # Final HF model export (deployment-ready: AutoModel.from_pretrained)
@@ -845,9 +1100,21 @@ def finetune(cfg: XVLAFinetuneConfig) -> None:
             distributed_state=distributed_state,
         )
 
+    # ------------------------------------------------------------------
+    # Best-model export → run_dir/best_hf (merged, deployment-ready).
+    # Evaluate the BEST checkpoint with: --model_path <run_dir>/best_hf  (no --pth)
+    # ------------------------------------------------------------------
+    if cfg.export_best_hf and best_step >= 0:
+        if distributed_state.is_main_process:
+            print(f"Exporting BEST HF model (val loss {best_val_loss:.4f} @ step {best_step}) ...")
+        export_best_hf(processor, cfg, best_adapter_dir, best_hf_dir, distributed_state)
+    dist.barrier()
+
     if distributed_state.is_main_process:
         wandb.finish()
         print(f"Training complete. Artifacts in: {run_dir}")
+        if cfg.export_best_hf and best_step >= 0:
+            print(f"  Best model (deployable): {best_hf_dir}")
 
 
 if __name__ == "__main__":

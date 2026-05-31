@@ -2,10 +2,11 @@
 # train_fruit_vla.sh — X-VLA fine-tuning for the fruit-clearing task
 # Usage: bash vla-scripts/train_fruit_vla.sh [NPZ_DATA_DIR] [NUM_GPUS] [FINETUNE_MODE]
 #
-# FINETUNE_MODE ∈ {soft_prompt, lora, full}  (default: soft_prompt)
+# FINETUNE_MODE ∈ {soft_prompt, lora, full}  (default: lora — official recipe)
 #   soft_prompt — freeze backbone, train only the embodiment soft prompts
-#                 (X-VLA's core adaptation method; best for a new robot + few demos)
-#   lora        — backbone frozen, LoRA adapters + soft prompts trained
+#                 (smallest; tends to underfit a brand-new robot)
+#   lora        — OFFICIAL X-VLA recipe: LoRA on all-linear + fully train the
+#                 Action Expert (action_encoder/decoder) + soft prompts
 #   full        — train everything (VLM layers at 1/10 LR)
 #
 # Small-data friendly: holds out 15% of EPISODES for validation + early stopping.
@@ -19,7 +20,7 @@
 
 NPZ_DATA_DIR=${1:-"raw_demos_left_third"}
 NUM_GPUS=${2:-1}
-FINETUNE_MODE=${3:-"soft_prompt"}
+FINETUNE_MODE=${3:-"lora"}
 
 torchrun \
     --standalone \
@@ -32,7 +33,18 @@ torchrun \
     --domain_id 3 \
     --num_actions 30 \
     --use_wrist_image True \
-    --learning_rate 1e-4 \
+    --frame_stride 3 \
+    --min_chunk_motion 0.01 \
+    --learning_rate 3e-5 \
+    --lora_rank 8 \
+    --lora_alpha 16 \
+    --train_action_expert True \
+    --freeze_steps 500 \
+    --max_grad_norm 1.0 \
+    --use_lr_schedule True \
+    --warmup_steps 1000 \
+    --use_cosine_decay True \
+    --min_lr_ratio 0.1 \
     --batch_size 32 \
     --grad_accumulation_steps 1 \
     --num_workers 8 \
